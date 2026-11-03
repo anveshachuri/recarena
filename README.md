@@ -108,11 +108,19 @@ If it runs slowly, set `OPENBLAS_NUM_THREADS=1` and `OMP_NUM_THREADS=1` first, b
 
 The tests compare the simulator with values worked out by hand from every possible slate, check the estimators against hand-calculated answers, and confirm that doubly robust stays unbiased even with a deliberately wrong model.
 
-## Next
+## Where this is going
 
-- Hidden effects that are harder on estimators, such as appeal tied to what policies favor
-- Testing whether disagreement between estimators can warn you when not to trust them
-- New user models and estimators contributed through a simple plug-in interface
+The goal is a shared, trustworthy place to answer: **which offline evaluation method can I trust, for which kind of recommender problem, and how would I know?**
+
+| Stage | What it adds |
+|---|---|
+| Now | One simulator, six estimators, and a stress test |
+| Next | Plug-in estimators and user models, so anyone can add one and benchmark it |
+| Then | Harder worlds, trained RL agents, warnings for when not to trust an estimate |
+| Later | Simulators calibrated to public datasets, and a public leaderboard of methods with reproducible results |
+| Open question | Choosing policies under budgets and fairness limits when you can only estimate their effects |
+
+This is a direction, not a promise. If you have a better idea, [open an issue](https://github.com/anveshachuri/recarena/issues). Contributions are welcome, and [CONTRIBUTING.md](CONTRIBUTING.md) explains how to start.
 
 ## License
 
