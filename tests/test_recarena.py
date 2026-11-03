@@ -100,6 +100,29 @@ def test_low_temperature_stays_numerically_stable():
     assert np.all(np.isfinite(policy.log_prob(obs, slates)))
 
 
+def test_simconfig_rejects_slate_larger_than_catalog():
+    with pytest.raises(ValueError, match="slate_size"):
+        SimConfig(n_items=4, slate_size=6)
+
+
+def test_simconfig_rejects_non_positive_horizon():
+    with pytest.raises(ValueError, match="horizon"):
+        SimConfig(horizon=0)
+
+
+def test_simconfig_rejects_fixed_interest_wrong_length():
+    with pytest.raises(ValueError, match="fixed_interest"):
+        SimConfig(n_topics=5, fixed_interest=(1.0,))
+
+
+def test_softmax_rejects_non_positive_temperature():
+    catalog = Catalog.generate(SimConfig())
+    with pytest.raises(ValueError, match="temperature"):
+        SoftmaxPolicy(catalog, temperature=0.0)
+    with pytest.raises(ValueError, match="temperature"):
+        SoftmaxPolicy(catalog, temperature=-1.0)
+
+
 def test_true_value_matches_hand_calculation():
     catalog = Catalog.generate(SMALL)
     policy = SoftmaxPolicy(catalog, quality_weight=2.0)

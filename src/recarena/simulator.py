@@ -36,6 +36,19 @@ class SimConfig:
     # Extra chance of leaving after a miss, per unit of sponsored share in the slate.
     sponsored_annoyance: float = 0.0
 
+    def __post_init__(self) -> None:
+        if self.slate_size > self.n_items:
+            raise ValueError(
+                f"slate_size ({self.slate_size}) cannot exceed n_items ({self.n_items})"
+            )
+        if self.horizon <= 0:
+            raise ValueError(f"horizon must be positive, got {self.horizon}")
+        if self.fixed_interest is not None and len(self.fixed_interest) != self.n_topics:
+            raise ValueError(
+                f"fixed_interest length ({len(self.fixed_interest)}) must equal "
+                f"n_topics ({self.n_topics})"
+            )
+
 
 @dataclass(frozen=True)
 class Catalog:
