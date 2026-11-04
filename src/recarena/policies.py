@@ -24,6 +24,10 @@ class SoftmaxPolicy:
     sponsored_weight: float = 0.0
     temperature: float = 1.0
 
+    def __post_init__(self) -> None:
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be positive, got {self.temperature}")
+
     def scores(self, obs: np.ndarray) -> np.ndarray:
         n_topics = self.catalog.topics.shape[1]
         raw = (
