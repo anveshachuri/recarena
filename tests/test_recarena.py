@@ -496,3 +496,141 @@ def test_budget_decisions_count_correct_answers():
     assert budget_decisions_correct(1.05, 1.0) == 2
     assert budget_decisions_correct(0.85, 1.0) == 1  # Too low: wrongly fits the tight budget.
     assert budget_decisions_correct(1.15, 1.0) == 1  # Too high: wrongly misses the loose budget.
+
+
+# ---------------------------------------------------------------------------
+# Pluggable estimators (issue #6)
+# ---------------------------------------------------------------------------
+
+from recarena import Estimate, EstimationTask, available_estimators, estimate_all, estimate_all_detailed, register_estimator  # noqa: E402
+from recarena.estimators import _REGISTRY, resolve_estimators, snips  # noqa: E402
+
+
+def task_with_ratios(data, ratios, values=None):
+    task = EstimationTask(data, data.rewards if values is None else values, None, 1.0, np.random.default_rng(0))
+    task.ratios = ratios
+    return task
+
+
+def test_influence_values_match_hand_calculations():
+    data, ratios = handmade_data()
+    task = task_with_ratios(data, ratios)
+    from recarena.estimators import _ips, _pdis, _snips, _snpdis
+
+    ips_result = _ips(task)
+    assert ips_result.value == pytest.approx(10.0)
+    assert ips_result.influence == pytest.approx([8.0, -8.0])
+
+    value = 20.0 / 3.5
+    snips_result = _snips(task)
+    assert snips_result.value == pytest.approx(value)
+    assert snips_result.influence == pytest.approx([3.0 * (6.0 - value) / 1.75, 0.5 * (4.0 - value) / 1.75])
+
+    pdis_result = _pdis(task)
+    assert pdis_result.influence == pytest.approx([13.0 - 7.5, 2.0 - 7.5])
+
+    weights = np.array([[2.0, 1.0, 3.0], [0.5, 0.5, 0.5]])
+    step = [(2 * 1 + 0.5 * 4) / 2.5, (1 * 2) / 1.5, (3 * 3) / 3.5]
+    expected = [
+        sum(weights[i, t] * (data.rewards[i, t] - step[t]) / weights[:, t].mean() for t in range(3)) for i in range(2)
+    ]
+    snpdis_result = _snpdis(task)
+    assert snpdis_result.value == pytest.approx(sum(step))
+    assert snpdis_result.influence == pytest.approx(expected)
+    for result in (ips_result, snips_result, pdis_result, snpdis_result):
+        assert result.influence.sum() == pytest.approx(0.0, abs=1e-12)
+
+
+def test_built_in_estimates_are_unchanged():
+    """The pluggable path must give exactly the old numbers, using the random stream in the same order."""
+    catalog = Catalog.generate(SHORT)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 3000, np.random.default_rng(30))
+    new = estimate_all(data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(31))
+    rng = np.random.default_rng(31)
+    ratios = importance_ratios(data, target)
+    direct, doubly = direct_and_dr(data, data.rewards, ratios, target, SHORT.examine_decay, rng)
+    old = {
+        "IPS": ips(data, data.rewards, ratios),
+        "SNIPS": snips(data, data.rewards, ratios),
+        "PDIS": pdis(data, data.rewards, ratios),
+        "SNPDIS": snpdis(data, data.rewards, ratios),
+        "Direct": direct,
+        "DR": doubly,
+    }
+    assert list(new) == list(old)
+    for name in old:
+        assert new[name] == old[name], name
+
+
+@pytest.mark.parametrize("name", ["SNIPS", "SNPDIS"])
+def test_delta_method_standard_error_matches_the_bootstrap(name):
+    catalog = Catalog.generate(SHORT)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 5000, np.random.default_rng(32))
+    rng = np.random.default_rng(33)
+    result = estimate_all_detailed(data, data.rewards, target, SHORT.examine_decay, rng, estimators=[name])[name]
+    ratios = importance_ratios(data, target)
+    estimator = {"SNIPS": snips, "SNPDIS": snpdis}[name]
+    boot = []
+    for _ in range(400):
+        index = rng.integers(0, data.n, data.n)
+        boot.append(estimator(data.subset(index), data.rewards[index], ratios[index]))
+    boot_se = np.std(boot, ddof=1)
+    # A standard deviation from 400 draws has a relative standard error of about 1/sqrt(800), 3.5%.
+    assert result.standard_error() == pytest.approx(boot_se, rel=4 / np.sqrt(800))
+
+
+def clipped_ips(task):
+    weights = np.minimum(task.ratios.prod(axis=1), 2.0)
+    return Estimate(float(np.mean(weights * task.values.sum(axis=1))))
+
+
+def test_custom_estimators_by_mapping_and_by_registration():
+    catalog = Catalog.generate(SHORT)
+    target = SoftmaxPolicy(catalog, history_weight=2.0)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 2000, np.random.default_rng(34))
+    ratios = importance_ratios(data, target)
+    expected = float(np.mean(np.minimum(ratios.prod(axis=1), 2.0) * data.rewards.sum(axis=1)))
+
+    by_mapping = estimate_all(
+        data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(0), estimators={"Clipped": clipped_ips}
+    )
+    assert by_mapping == {"Clipped": pytest.approx(expected)}
+
+    # A plain number is accepted as the value.
+    plain = estimate_all(
+        data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(0), estimators={"Half": lambda t: 0.5}
+    )
+    assert plain == {"Half": 0.5}
+
+    register_estimator("Clipped IPS", clipped_ips)
+    try:
+        assert "Clipped IPS" in available_estimators()
+        both = estimate_all(
+            data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(0), estimators=["IPS", "Clipped IPS"]
+        )
+        assert list(both) == ["IPS", "Clipped IPS"]
+        assert both["Clipped IPS"] == pytest.approx(expected)
+        with pytest.raises(ValueError, match="already registered"):
+            register_estimator("Clipped IPS", clipped_ips)
+        register_estimator("Clipped IPS", clipped_ips, overwrite=True)
+    finally:
+        _REGISTRY.pop("Clipped IPS", None)
+
+    with pytest.raises(ValueError, match="built-in"):
+        register_estimator("IPS", clipped_ips, overwrite=True)
+    with pytest.raises(ValueError, match="unknown estimators"):
+        resolve_estimators(["IPS", "Nope"])
+    with pytest.raises(TypeError):
+        register_estimator("Bad", 3)
+    with pytest.raises(TypeError):
+        resolve_estimators({"Bad": 3})
+
+
+def test_benchmark_runs_with_a_subset_of_estimators():
+    from recarena.benchmark import run
+
+    report = run([100], 1, 2000, 1.25, 1, 1, estimators=["IPS", "DR"])
+    header = next(line for line in report.splitlines() if line.startswith("| Target policy | Sessions logged"))
+    assert header == "| Target policy | Sessions logged | IPS | DR |"

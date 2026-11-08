@@ -2,7 +2,15 @@
 
 from .data import LoggedData, TrueValue, collect, true_value
 from .env import SlateRecEnv
-from .estimators import ESTIMATOR_NAMES, estimate_all
+from .estimators import (
+    ESTIMATOR_NAMES,
+    Estimate,
+    EstimationTask,
+    available_estimators,
+    estimate_all,
+    estimate_all_detailed,
+    register_estimator,
+)
 from .policies import SoftmaxPolicy
 from .simulator import BatchSimulator, Catalog, SimConfig
 
@@ -10,12 +18,17 @@ __all__ = [
     "BatchSimulator",
     "Catalog",
     "ESTIMATOR_NAMES",
+    "Estimate",
+    "EstimationTask",
     "LoggedData",
     "SimConfig",
     "SlateRecEnv",
     "SoftmaxPolicy",
     "TrueValue",
+    "available_estimators",
     "collect",
     "estimate_all",
+    "estimate_all_detailed",
+    "register_estimator",
     "true_value",
 ]

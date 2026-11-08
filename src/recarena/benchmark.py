@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor
 import numpy as np
 
 from .data import collect, true_value
-from .estimators import ESTIMATOR_NAMES, estimate_all
+from .estimators import available_estimators, estimate_all, resolve_estimators
 from .policies import SoftmaxPolicy
 from .simulator import Catalog, SimConfig
 
@@ -30,19 +30,30 @@ def target_policies(catalog: Catalog) -> list[SoftmaxPolicy]:
 
 def score_one_dataset(job):
     """One logged dataset scored for every target. Seeded per job, so worker count doesn't matter."""
-    config, catalog, behavior, targets, n, seed = job
+    config, catalog, behavior, targets, n, seed, estimators = job
     rng = np.random.default_rng(seed)
     data = collect(config, catalog, behavior, n, rng)
     return n, {
         p.name: (
-            estimate_all(data, data.rewards, p, config.examine_decay, rng),
-            estimate_all(data, data.costs, p, config.examine_decay, rng),
+            estimate_all(data, data.rewards, p, config.examine_decay, rng, estimators=estimators),
+            estimate_all(data, data.costs, p, config.examine_decay, rng, estimators=estimators),
         )
         for p in targets
     }
 
 
-def run(sizes: list[int], seeds: int, truth_runs: int, budget_ratio: float, seed: int, workers: int) -> str:
+def run(
+    sizes: list[int],
+    seeds: int,
+    truth_runs: int,
+    budget_ratio: float,
+    seed: int,
+    workers: int,
+    estimators=None,
+) -> str:
+    """``estimators`` is a list of names, a name-to-function mapping, or None for the built-ins."""
+    estimators = resolve_estimators(estimators)
+    names = list(estimators)
     config = SimConfig()
     catalog = Catalog.generate(config)
     behavior = SoftmaxPolicy(catalog, "logging", 1.0, 1.0, 0.0, 1.0)
@@ -70,11 +81,11 @@ def run(sizes: list[int], seeds: int, truth_runs: int, budget_ratio: float, seed
         )
     lines += ["", f"Budget: sponsored exposure of at most {budget:.3f}.", ""]
 
-    errors = {(p.name, n, e): [] for p in targets for n in sizes for e in ESTIMATOR_NAMES}
-    correct = {(p.name, n, e): 0 for p in targets for n in sizes for e in ESTIMATOR_NAMES}
+    errors = {(p.name, n, e): [] for p in targets for n in sizes for e in names}
+    correct = {(p.name, n, e): 0 for p in targets for n in sizes for e in names}
     job_seeds = np.random.SeedSequence(seed).spawn(len(sizes) * seeds)
     jobs = [
-        (config, catalog, behavior, targets, n, job_seeds[i * seeds + j])
+        (config, catalog, behavior, targets, n, job_seeds[i * seeds + j], estimators)
         for i, n in enumerate(sizes)
         for j in range(seeds)
     ]
@@ -83,17 +94,17 @@ def run(sizes: list[int], seeds: int, truth_runs: int, budget_ratio: float, seed
             for p in targets:
                 t = truths[p.name]
                 rewards, costs = results[p.name]
-                for e in ESTIMATOR_NAMES:
+                for e in names:
                     errors[(p.name, n, e)].append(rewards[e] - t.reward)
                     correct[(p.name, n, e)] += (costs[e] <= budget) == (t.cost <= budget)
 
     def table(title: str, cell) -> list[str]:
         out = [f"## {title}", ""]
-        out.append("| Target policy | Sessions logged | " + " | ".join(ESTIMATOR_NAMES) + " |")
-        out.append("|---|---:|" + "---:|" * len(ESTIMATOR_NAMES))
+        out.append("| Target policy | Sessions logged | " + " | ".join(names) + " |")
+        out.append("|---|---:|" + "---:|" * len(names))
         for p in targets:
             for n in sizes:
-                out.append(f"| {p.name} | {n:,} | " + " | ".join(cell(p, n, e) for e in ESTIMATOR_NAMES) + " |")
+                out.append(f"| {p.name} | {n:,} | " + " | ".join(cell(p, n, e) for e in names) + " |")
         return out + [""]
 
     def rmse(p, n, e) -> str:
@@ -122,9 +133,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=4004)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--output", default=None)
+    parser.add_argument("--estimators", nargs="+", default=None, help=f"Default: all built-in. Available: {', '.join(available_estimators())}")
     args = parser.parse_args()
     start = time.time()
-    report = run(args.sizes, args.seeds, args.truth, args.budget_ratio, args.seed, args.workers)
+    report = run(args.sizes, args.seeds, args.truth, args.budget_ratio, args.seed, args.workers, args.estimators)
     report += f"\nFinished in {time.time() - start:.0f} s with seed {args.seed}.\n"
     print(report)
     if args.output:

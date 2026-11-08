@@ -15,7 +15,7 @@ import numpy as np
 
 from .benchmark import target_policies
 from .data import TrueValue, collect, true_value
-from .estimators import ESTIMATOR_NAMES, estimate_all
+from .estimators import available_estimators, estimate_all, resolve_estimators
 from .policies import SoftmaxPolicy
 from .simulator import Catalog, SimConfig
 
@@ -66,20 +66,31 @@ def truth_job(job) -> tuple[tuple, TrueValue]:
 
 
 def estimate_job(job) -> tuple[tuple, dict]:
-    scenario, catalog_seed, n, seed = job
+    scenario, catalog_seed, n, seed, estimators = job
     config = build_config(scenario, catalog_seed)
     catalog = Catalog.generate(config)
     rng = np.random.default_rng(seed)
     data = collect(config, catalog, SoftmaxPolicy(catalog, "logging"), n, rng)
     results = {}
     for p in target_policies(catalog):
-        rewards = estimate_all(data, data.rewards, p, config.examine_decay, rng, scenario.informed_model)
-        costs = estimate_all(data, data.costs, p, config.examine_decay, rng, scenario.informed_model)
+        rewards = estimate_all(data, data.rewards, p, config.examine_decay, rng, scenario.informed_model, estimators)
+        costs = estimate_all(data, data.costs, p, config.examine_decay, rng, scenario.informed_model, estimators)
         results[p.name] = (rewards, costs)
     return (scenario.name, catalog_seed, n), results
 
 
-def run(sizes: list[int], catalogs: int, repeats: int, truth_runs: int, seed: int, workers: int) -> str:
+def run(
+    sizes: list[int],
+    catalogs: int,
+    repeats: int,
+    truth_runs: int,
+    seed: int,
+    workers: int,
+    estimators=None,
+) -> str:
+    """``estimators`` is a list of names, a name-to-function mapping, or None for the built-ins."""
+    estimators = resolve_estimators(estimators)
+    names = list(estimators)
     worlds = sorted({(s.hidden_appeal, s.sponsored_annoyance) for s in SCENARIOS})
     policy_names = [p.name for p in target_policies(Catalog.generate(SimConfig()))]
     root = np.random.SeedSequence(seed)
@@ -95,13 +106,13 @@ def run(sizes: list[int], catalogs: int, repeats: int, truth_runs: int, seed: in
             )
         )
         rows = []
-        jobs = [(*key, s) for key, s in zip(estimate_keys, estimate_seeds.spawn(len(estimate_keys)))]
+        jobs = [(*key, s, estimators) for key, s in zip(estimate_keys, estimate_seeds.spawn(len(estimate_keys)))]
         for (name, catalog_seed, n), results in pool.map(estimate_job, jobs):
             scenario = next(s for s in SCENARIOS if s.name == name)
             world = (scenario.hidden_appeal, scenario.sponsored_annoyance)
             for policy_name, (rewards, costs) in results.items():
                 truth = truths[(world, catalog_seed, policy_name)]
-                for e in ESTIMATOR_NAMES:
+                for e in names:
                     rows.append(
                         (
                             name,
@@ -132,25 +143,25 @@ def run(sizes: list[int], catalogs: int, repeats: int, truth_runs: int, seed: in
     ]
     for s in SCENARIOS:
         lines += [f"## {s.name} ({largest:,} sessions)", ""]
-        lines.append("| New policy | " + " | ".join(ESTIMATOR_NAMES) + " |")
-        lines.append("|---|" + "---:|" * len(ESTIMATOR_NAMES))
+        lines.append("| New policy | " + " | ".join(names) + " |")
+        lines.append("|---|" + "---:|" * len(names))
         for p in policy_names:
             cells = [
                 (lambda sub: f"{median_error(sub):.1f} / {rmse(sub):.1f}")(
                     select(scenario=s.name, n=largest, policy=p, estimator=e)
                 )
-                for e in ESTIMATOR_NAMES
+                for e in names
             ]
             lines.append(f"| {p} | " + " | ".join(cells) + " |")
         lines.append("")
 
     lines += ["## Far-from-logging policies at each size (RMSE, pooled across catalogs)", ""]
-    lines.append("| Scenario | Sessions | " + " | ".join(ESTIMATOR_NAMES) + " |")
-    lines.append("|---|---:|" + "---:|" * len(ESTIMATOR_NAMES))
+    lines.append("| Scenario | Sessions | " + " | ".join(names) + " |")
+    lines.append("|---|---:|" + "---:|" * len(names))
     for s in SCENARIOS:
         for n in sizes:
             cells = []
-            for e in ESTIMATOR_NAMES:
+            for e in names:
                 subset = [r for r in select(scenario=s.name, n=n, estimator=e) if r[3] in FAR_TARGETS]
                 cells.append(f"{rmse(subset):.1f}")
             lines.append(f"| {s.name} | {n:,} | " + " | ".join(cells) + " |")
@@ -160,7 +171,7 @@ def run(sizes: list[int], catalogs: int, repeats: int, truth_runs: int, seed: in
     lines.append("| Scenario | Estimator | " + " | ".join(f"Catalog {c}" for c in range(catalogs)) + " |")
     lines.append("|---|---|" + "---:|" * catalogs)
     for s in SCENARIOS:
-        for e in ("SNPDIS", "Direct", "DR"):
+        for e in [e for e in ("SNPDIS", "Direct", "DR") if e in names]:
             cells = []
             for c in range(catalogs):
                 subset = [r for r in select(scenario=s.name, catalog=c, n=largest, estimator=e) if r[3] in FAR_TARGETS]
@@ -175,12 +186,12 @@ def run(sizes: list[int], catalogs: int, repeats: int, truth_runs: int, seed: in
         "The table shows the share of decisions that were right. 50% is what a method gets if it always answers the same way.",
         "",
     ]
-    lines.append("| Scenario | New policies | " + " | ".join(ESTIMATOR_NAMES) + " |")
-    lines.append("|---|---|" + "---:|" * len(ESTIMATOR_NAMES))
+    lines.append("| Scenario | New policies | " + " | ".join(names) + " |")
+    lines.append("|---|---|" + "---:|" * len(names))
     for s in SCENARIOS:
         for label, keep in (("Near", lambda p: p not in FAR_TARGETS), ("Far", lambda p: p in FAR_TARGETS)):
             cells = []
-            for e in ESTIMATOR_NAMES:
+            for e in names:
                 subset = [r for r in select(scenario=s.name, n=largest, estimator=e) if keep(r[3])]
                 cells.append(f"{100 * np.mean([r[6] for r in subset]) / 2:.0f}%")
             lines.append(f"| {s.name} | {label} | " + " | ".join(cells) + " |")
@@ -197,9 +208,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=4004)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--output", default=None)
+    parser.add_argument("--estimators", nargs="+", default=None, help=f"Default: all built-in. Available: {', '.join(available_estimators())}")
     args = parser.parse_args()
     start = time.time()
-    report = run(args.sizes, args.catalogs, args.repeats, args.truth, args.seed, args.workers)
+    report = run(args.sizes, args.catalogs, args.repeats, args.truth, args.seed, args.workers, args.estimators)
     report += f"\nFinished in {time.time() - start:.0f} s with seed {args.seed}.\n"
     print(report)
     if args.output:

@@ -48,6 +48,23 @@ print("true value:", round(truth.reward, 3))
 print({name: round(value, 3) for name, value in estimates.items()})
 ```
 
+Add your own estimator. It gets an `EstimationTask` (the logs, the values to estimate, the target policy and shared importance ratios) and returns an `Estimate`:
+
+```python
+from recarena import Estimate, estimate_all_detailed, register_estimator
+
+def clipped_ips(task):
+    weights = np.minimum(task.ratios.prod(axis=1), 10.0)
+    scores = weights * task.values.sum(axis=1)
+    return Estimate(scores.mean(), scores - scores.mean())  # The second part is optional.
+
+register_estimator("Clipped IPS", clipped_ips)
+results = estimate_all_detailed(logs, logs.rewards, new, config.examine_decay, rng, estimators=["IPS", "Clipped IPS"])
+print({name: (round(r.value, 3), round(r.standard_error(), 3)) for name, r in results.items()})
+```
+
+The second part of an `Estimate` is each session's influence on the estimate. Confidence intervals are built from it, and every built-in estimator provides it. The benchmark and stress test take `--estimators` to choose which to run. To use your own estimator there, pass the function itself to `run(..., estimators={"Clipped IPS": clipped_ips})` from a module it can be imported from.
+
 Or train an agent:
 
 ```python
@@ -115,7 +132,7 @@ The goal is a shared, trustworthy place to answer: **which offline evaluation me
 | Stage | What it adds |
 |---|---|
 | Now | One simulator, six estimators, and a stress test |
-| Next | Plug-in estimators and user models, so anyone can add one and benchmark it |
+| Next | Plug-in user models (estimators can already be plugged in), so anyone can benchmark their own world |
 | Then | Harder worlds, trained RL agents, warnings for when not to trust an estimate |
 | Later | Simulators calibrated to public datasets, and a public leaderboard of methods with reproducible results |
 | Open question | Choosing policies under budgets and fairness limits when you can only estimate their effects |
