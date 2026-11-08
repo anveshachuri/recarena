@@ -2,9 +2,17 @@
 
 Every estimator takes ``values``, a (n, horizon) array of per-step outcomes. Passing
 rewards estimates the policy's reward. Passing costs estimates its budget use.
+
+To add your own estimator, write a function from ``EstimationTask`` to ``Estimate`` and
+either pass it to ``estimate_all(..., estimators={"Mine": fn})`` or register it with
+``register_estimator("Mine", fn)``.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, field
+from functools import cached_property
 
 import numpy as np
 
@@ -128,6 +136,28 @@ def dr_with_model(
     return score
 
 
+def direct_and_dr_scores(
+    data: LoggedData,
+    values: np.ndarray,
+    ratios: np.ndarray,
+    target: SoftmaxPolicy,
+    examine_decay: float,
+    rng: np.random.Generator,
+    informed: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-session direct method and doubly robust scores, each from a model fitted on the other fold."""
+    order = rng.permutation(data.n)
+    folds = np.array_split(order, 2)
+    direct_scores = np.zeros(data.n)
+    dr_scores = np.zeros(data.n)
+    for held_out, fit_on in ((folds[0], folds[1]), (folds[1], folds[0])):
+        model = FittedQ(target, examine_decay, informed=informed).fit(data.subset(fit_on), values[fit_on], rng)
+        part = data.subset(held_out)
+        direct_scores[held_out] = model.state_value(0, part.obs[:, 0], rng)
+        dr_scores[held_out] = dr_with_model(part, values[held_out], ratios[held_out], model, rng)
+    return direct_scores, dr_scores
+
+
 def direct_and_dr(
     data: LoggedData,
     values: np.ndarray,
@@ -138,19 +168,189 @@ def direct_and_dr(
     informed: bool = True,
 ) -> tuple[float, float]:
     """Direct method and doubly robust, each model scored on data it was not fitted on."""
-    order = rng.permutation(data.n)
-    folds = np.array_split(order, 2)
-    direct_scores = np.zeros(data.n)
-    dr_scores = np.zeros(data.n)
-    for held_out, fit_on in ((folds[0], folds[1]), (folds[1], folds[0])):
-        model = FittedQ(target, examine_decay, informed=informed).fit(data.subset(fit_on), values[fit_on], rng)
-        part = data.subset(held_out)
-        direct_scores[held_out] = model.state_value(0, part.obs[:, 0], rng)
-        dr_scores[held_out] = dr_with_model(part, values[held_out], ratios[held_out], model, rng)
+    direct_scores, dr_scores = direct_and_dr_scores(data, values, ratios, target, examine_decay, rng, informed)
     return float(direct_scores.mean()), float(dr_scores.mean())
 
 
+# ---------------------------------------------------------------------------
+# Pluggable estimators
+#
+# An estimator is any function that takes an ``EstimationTask`` and returns an
+# ``Estimate``. Built-in and user estimators are treated the same way.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Estimate:
+    """An estimate, and optionally how much each logged session moved it.
+
+    ``influence`` has one entry per session with mean zero, such that the estimate's
+    variance is approximately ``influence.var() / n``. It is what confidence intervals
+    are built from. Estimators that can't provide it leave it as ``None``.
+    """
+
+    value: float
+    influence: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", float(self.value))
+        if self.influence is not None:
+            object.__setattr__(self, "influence", np.asarray(self.influence, dtype=float))
+
+    def standard_error(self) -> float:
+        """Plug-in standard error from the influence values, or NaN if there are none."""
+        if self.influence is None or len(self.influence) < 2:
+            return float("nan")
+        return float(np.std(self.influence, ddof=1) / np.sqrt(len(self.influence)))
+
+
+@dataclass
+class EstimationTask:
+    """Everything an estimator may use: the logs, the values to estimate, and the target policy.
+
+    ``values`` is ``data.rewards`` to estimate reward, or ``data.costs`` to estimate cost.
+    Shared work (importance ratios, the fitted models for Direct and DR) is computed once
+    and reused by every estimator that asks for it.
+    """
+
+    data: LoggedData
+    values: np.ndarray
+    target: SoftmaxPolicy
+    examine_decay: float
+    rng: np.random.Generator
+    informed: bool = True
+    _model_scores: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False, repr=False)
+
+    @cached_property
+    def ratios(self) -> np.ndarray:
+        return importance_ratios(self.data, self.target)
+
+    def model_scores(self) -> tuple[np.ndarray, np.ndarray]:
+        """Per-session (Direct, DR) scores. Fitted once, on first use."""
+        if self._model_scores is None:
+            self._model_scores = direct_and_dr_scores(
+                self.data, self.values, self.ratios, self.target, self.examine_decay, self.rng, self.informed
+            )
+        return self._model_scores
+
+
+Estimator = Callable[[EstimationTask], Estimate]
+
+
+def _mean_estimate(scores: np.ndarray) -> Estimate:
+    value = float(scores.mean())
+    return Estimate(value, scores - value)
+
+
+def _ips(task: EstimationTask) -> Estimate:
+    return _mean_estimate(task.ratios.prod(axis=1) * task.values.sum(axis=1))
+
+
+def _snips(task: EstimationTask) -> Estimate:
+    weights = task.ratios.prod(axis=1)
+    returns = task.values.sum(axis=1)
+    value = float(np.sum(weights * returns) / np.sum(weights))
+    # Delta method for a ratio of means.
+    return Estimate(value, weights * (returns - value) / weights.mean())
+
+
+def _pdis(task: EstimationTask) -> Estimate:
+    return _mean_estimate(np.sum(np.cumprod(task.ratios, axis=1) * task.values, axis=1))
+
+
+def _snpdis(task: EstimationTask) -> Estimate:
+    weights = np.cumprod(task.ratios, axis=1)
+    step_values = np.sum(weights * task.values, axis=0) / np.sum(weights, axis=0)
+    # Delta method, step by step: each step is a ratio of means.
+    influence = np.sum(weights * (task.values - step_values) / weights.mean(axis=0), axis=1)
+    return Estimate(float(step_values.sum()), influence)
+
+
+def _direct(task: EstimationTask) -> Estimate:
+    # The influence treats the fitted models as fixed, so intervals from it ignore model-fitting noise.
+    return _mean_estimate(task.model_scores()[0])
+
+
+def _dr(task: EstimationTask) -> Estimate:
+    return _mean_estimate(task.model_scores()[1])
+
+
 ESTIMATOR_NAMES = ("IPS", "SNIPS", "PDIS", "SNPDIS", "Direct", "DR")
+
+_BUILT_IN: dict[str, Estimator] = {
+    "IPS": _ips,
+    "SNIPS": _snips,
+    "PDIS": _pdis,
+    "SNPDIS": _snpdis,
+    "Direct": _direct,
+    "DR": _dr,
+}
+_REGISTRY: dict[str, Estimator] = dict(_BUILT_IN)
+
+
+def register_estimator(name: str, estimator: Estimator, *, overwrite: bool = False) -> None:
+    """Make ``estimator`` available by ``name`` to ``estimate_all`` and the benchmarks.
+
+    Built-in names can't be replaced. Registration only lasts for the current process, so
+    to use a new estimator in the benchmark's worker processes, pass the function itself
+    (it must be importable, for example defined at the top level of a module).
+    """
+    if not callable(estimator):
+        raise TypeError("estimator must be callable")
+    if name in _BUILT_IN:
+        raise ValueError(f"{name!r} is a built-in estimator and can't be replaced")
+    if name in _REGISTRY and not overwrite:
+        raise ValueError(f"an estimator named {name!r} is already registered; pass overwrite=True to replace it")
+    _REGISTRY[name] = estimator
+
+
+def available_estimators() -> tuple[str, ...]:
+    """Names of every estimator that can be requested, built-in ones first."""
+    return tuple(_REGISTRY)
+
+
+def resolve_estimators(
+    estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
+) -> dict[str, Estimator]:
+    """Turn names, a name-to-function mapping, or ``None`` (the built-ins) into a name-to-function dict."""
+    if estimators is None:
+        return dict(_BUILT_IN)
+    if isinstance(estimators, Mapping):
+        resolved = dict(estimators)
+        for name, fn in resolved.items():
+            if not callable(fn):
+                raise TypeError(f"estimator {name!r} is not callable")
+        return resolved
+    names = list(estimators)
+    unknown = [n for n in names if n not in _REGISTRY]
+    if unknown:
+        raise ValueError(f"unknown estimators {unknown}; available: {list(_REGISTRY)}")
+    return {n: _REGISTRY[n] for n in names}
+
+
+def estimate_all_detailed(
+    data: LoggedData,
+    values: np.ndarray,
+    target: SoftmaxPolicy,
+    examine_decay: float,
+    rng: np.random.Generator,
+    informed: bool = True,
+    estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
+) -> dict[str, Estimate]:
+    """Run each estimator on the same task. Defaults to the built-in estimators."""
+    task = EstimationTask(data, values, target, examine_decay, rng, informed)
+    resolved = resolve_estimators(estimators)
+    # Fit the models first whenever Direct or DR is requested, so the random number
+    # stream is used in the same order as before estimators were pluggable.
+    if "Direct" in resolved or "DR" in resolved:
+        task.model_scores()
+    results = {}
+    for name, fn in resolved.items():
+        result = fn(task)
+        if not isinstance(result, Estimate):
+            result = Estimate(float(result))
+        results[name] = result
+    return results
 
 
 def estimate_all(
@@ -160,14 +360,8 @@ def estimate_all(
     examine_decay: float,
     rng: np.random.Generator,
     informed: bool = True,
+    estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
 ) -> dict[str, float]:
-    ratios = importance_ratios(data, target)
-    direct, dr = direct_and_dr(data, values, ratios, target, examine_decay, rng, informed)
-    return {
-        "IPS": ips(data, values, ratios),
-        "SNIPS": snips(data, values, ratios),
-        "PDIS": pdis(data, values, ratios),
-        "SNPDIS": snpdis(data, values, ratios),
-        "Direct": direct,
-        "DR": dr,
-    }
+    """Point estimates from each estimator. Defaults to the built-in estimators."""
+    detailed = estimate_all_detailed(data, values, target, examine_decay, rng, informed, estimators)
+    return {name: result.value for name, result in detailed.items()}
