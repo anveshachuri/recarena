@@ -22,6 +22,7 @@ The full stress test takes a long time. Don't run it unless the task needs it.
 | `src/recarena/data.py` | Logging sessions and measuring true values |
 | `src/recarena/estimators.py` | Off-policy estimators and fitted Q evaluation |
 | `src/recarena/benchmark.py`, `stress.py` | Scoring estimators against true values |
+| `src/recarena/exploration.py` | How the logging policy's exploration level changes estimator error (#17) |
 | `tests/test_recarena.py` | Hand calculations and statistical checks |
 
 ## Rules that are easy to break
