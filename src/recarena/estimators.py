@@ -6,6 +6,9 @@ rewards estimates the policy's reward. Passing costs estimates its budget use.
 To add your own estimator, write a function from ``EstimationTask`` to ``Estimate`` and
 either pass it to ``estimate_all(..., estimators={"Mine": fn})`` or register it with
 ``register_estimator("Mine", fn)``.
+
+Two slate-aware estimators, ``CascadePDIS`` and ``SNCascadePDIS``, are available by name
+but are not run by default, so existing results don't change.
 """
 
 from __future__ import annotations
@@ -27,6 +30,21 @@ def importance_ratios(data: LoggedData, target: SoftmaxPolicy) -> np.ndarray:
     flat_slates = data.slates.reshape(n * h, -1)
     target_log_prob = target.log_prob(flat_obs, flat_slates).reshape(n, h)
     return np.where(data.active, np.exp(target_log_prob - data.behavior_log_prob), 1.0)
+
+
+def prefix_ratios(data: LoggedData, target: SoftmaxPolicy) -> np.ndarray:
+    """Ratio of target to behavior probability for each slate's first ``j + 1`` slots.
+
+    Shape (n, horizon, slate_size). The last slot's ratio equals ``importance_ratios``.
+    After a session ends every ratio is 1.
+    """
+    if data.behavior_prefix_log_prob is None:
+        raise ValueError("these logs have no behavior_prefix_log_prob; log them with collect()")
+    n, h, k = data.slates.shape
+    flat_obs = data.obs.reshape(n * h, -1)
+    flat_slates = data.slates.reshape(n * h, k)
+    target_log_prob = target.prefix_log_prob(flat_obs, flat_slates).reshape(n, h, k)
+    return np.where(data.active[:, :, None], np.exp(target_log_prob - data.behavior_prefix_log_prob), 1.0)
 
 
 def ips(data: LoggedData, values: np.ndarray, ratios: np.ndarray) -> float:
@@ -219,11 +237,38 @@ class EstimationTask:
     examine_decay: float
     rng: np.random.Generator
     informed: bool = True
+    # Per-slot values, (n, horizon, slate_size), summing over slots to ``values``. Only the
+    # slate-aware estimators use them. If left out, they are taken from the logs when
+    # ``values`` is ``data.rewards`` or ``data.costs``.
+    slot_values: np.ndarray | None = None
     _model_scores: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False, repr=False)
 
     @cached_property
     def ratios(self) -> np.ndarray:
         return importance_ratios(self.data, self.target)
+
+    @cached_property
+    def prefix_ratios(self) -> np.ndarray:
+        return prefix_ratios(self.data, self.target)
+
+    @cached_property
+    def per_slot_values(self) -> np.ndarray:
+        """``slot_values`` if given, otherwise the logged per-slot rewards or costs."""
+        slot_values = self.slot_values
+        if slot_values is None:
+            if self.values is self.data.rewards:
+                slot_values = self.data.slot_rewards
+            elif self.values is self.data.costs:
+                slot_values = self.data.slot_costs
+        if slot_values is None:
+            raise ValueError(
+                "slate-aware estimators need per-slot values: pass slot_values, or pass "
+                "data.rewards or data.costs from logs made by collect()"
+            )
+        slot_values = np.asarray(slot_values, dtype=float)
+        if slot_values.shape != self.data.slates.shape or not np.allclose(slot_values.sum(axis=2), self.values):
+            raise ValueError("slot_values must have shape (n, horizon, slate_size) and sum over slots to values")
+        return slot_values
 
     def model_scores(self) -> tuple[np.ndarray, np.ndarray]:
         """Per-session (Direct, DR) scores. Fitted once, on first use."""
@@ -275,7 +320,37 @@ def _dr(task: EstimationTask) -> Estimate:
     return _mean_estimate(task.model_scores()[1])
 
 
+def _cascade_weights(task: EstimationTask) -> np.ndarray:
+    """Weight for the value in slot ``j`` of step ``t``: full slates before ``t``, then slots up to ``j``."""
+    before = np.cumprod(task.ratios, axis=1)
+    before = np.concatenate([np.ones((task.data.n, 1)), before[:, :-1]], axis=1)
+    return before[:, :, None] * task.prefix_ratios
+
+
+def _cascade_pdis(task: EstimationTask) -> Estimate:
+    """Per-decision IS that, within a step, only pays for the slots at or above the one that paid off.
+
+    Follows the cascade idea of Kiyohara et al. (2022) and McInerney et al. (2020), applied
+    per step of a session. It is unbiased when a slot's reward and cost depend only on the
+    slots above it in the same step, which holds in this simulator: users read top down
+    and stop at their first click. What happens in later steps can depend on the whole
+    slate, so earlier steps still pay for full slates.
+    """
+    return _mean_estimate(np.sum(_cascade_weights(task) * task.per_slot_values, axis=(1, 2)))
+
+
+def _sn_cascade_pdis(task: EstimationTask) -> Estimate:
+    """CascadePDIS with normalized weights for each step and slot."""
+    weights = _cascade_weights(task)
+    values = task.per_slot_values
+    cell_values = np.sum(weights * values, axis=0) / np.sum(weights, axis=0)
+    # Delta method: each (step, slot) is a ratio of means.
+    influence = np.sum(weights * (values - cell_values) / weights.mean(axis=0), axis=(1, 2))
+    return Estimate(float(cell_values.sum()), influence)
+
+
 ESTIMATOR_NAMES = ("IPS", "SNIPS", "PDIS", "SNPDIS", "Direct", "DR")
+SLATE_AWARE_NAMES = ("CascadePDIS", "SNCascadePDIS")
 
 _BUILT_IN: dict[str, Estimator] = {
     "IPS": _ips,
@@ -285,7 +360,12 @@ _BUILT_IN: dict[str, Estimator] = {
     "Direct": _direct,
     "DR": _dr,
 }
-_REGISTRY: dict[str, Estimator] = dict(_BUILT_IN)
+# Available by name, but not run by default.
+_SLATE_AWARE: dict[str, Estimator] = {
+    "CascadePDIS": _cascade_pdis,
+    "SNCascadePDIS": _sn_cascade_pdis,
+}
+_REGISTRY: dict[str, Estimator] = {**_BUILT_IN, **_SLATE_AWARE}
 
 
 def register_estimator(name: str, estimator: Estimator, *, overwrite: bool = False) -> None:
@@ -297,7 +377,7 @@ def register_estimator(name: str, estimator: Estimator, *, overwrite: bool = Fal
     """
     if not callable(estimator):
         raise TypeError("estimator must be callable")
-    if name in _BUILT_IN:
+    if name in _BUILT_IN or name in _SLATE_AWARE:
         raise ValueError(f"{name!r} is a built-in estimator and can't be replaced")
     if name in _REGISTRY and not overwrite:
         raise ValueError(f"an estimator named {name!r} is already registered; pass overwrite=True to replace it")
@@ -336,9 +416,10 @@ def estimate_all_detailed(
     rng: np.random.Generator,
     informed: bool = True,
     estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
+    slot_values: np.ndarray | None = None,
 ) -> dict[str, Estimate]:
     """Run each estimator on the same task. Defaults to the built-in estimators."""
-    task = EstimationTask(data, values, target, examine_decay, rng, informed)
+    task = EstimationTask(data, values, target, examine_decay, rng, informed, slot_values)
     resolved = resolve_estimators(estimators)
     # Fit the models first whenever Direct or DR is requested, so the random number
     # stream is used in the same order as before estimators were pluggable.
@@ -361,7 +442,8 @@ def estimate_all(
     rng: np.random.Generator,
     informed: bool = True,
     estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
+    slot_values: np.ndarray | None = None,
 ) -> dict[str, float]:
     """Point estimates from each estimator. Defaults to the built-in estimators."""
-    detailed = estimate_all_detailed(data, values, target, examine_decay, rng, informed, estimators)
+    detailed = estimate_all_detailed(data, values, target, examine_decay, rng, informed, estimators, slot_values)
     return {name: result.value for name, result in detailed.items()}

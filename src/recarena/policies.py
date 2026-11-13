@@ -56,6 +56,26 @@ class SoftmaxPolicy:
             scores[rows, items] = -np.inf
         return total
 
+    def prefix_log_prob(self, obs: np.ndarray, slates: np.ndarray) -> np.ndarray:
+        """Log probability of each slate's first ``j + 1`` slots, for every ``j``. Shape (n, slate_size).
+
+        The last column is the whole slate's log probability. Slate-aware estimators use
+        the earlier columns, since a reward in slot ``j`` depends only on slots up to ``j``.
+        """
+        scores = self.scores(obs).copy()
+        rows = np.arange(len(obs))
+        out = np.zeros(slates.shape, dtype=float)
+        total = np.zeros(len(obs))
+        for slot in range(slates.shape[1]):
+            items = slates[:, slot]
+            top = scores.max(axis=1, keepdims=True)
+            with np.errstate(divide="ignore"):
+                denominator = top[:, 0] + np.log(np.exp(scores - top).sum(axis=1))
+            total = total + scores[rows, items] - denominator
+            out[:, slot] = total
+            scores[rows, items] = -np.inf
+        return out
+
 
 @dataclass(frozen=True)
 class UniformMixturePolicy:
@@ -89,5 +109,15 @@ class UniformMixturePolicy:
         with np.errstate(divide="ignore"):
             return np.logaddexp(
                 np.log1p(-self.epsilon) + self.base.log_prob(obs, slates),
+                np.log(self.epsilon) + uniform,
+            )
+
+    def prefix_log_prob(self, obs: np.ndarray, slates: np.ndarray) -> np.ndarray:
+        """Log probability of each slate's first ``j + 1`` slots, for every ``j``. Shape (n, slate_size)."""
+        n_items = self.base.catalog.quality.shape[0]
+        uniform = -np.cumsum(np.log(n_items - np.arange(slates.shape[1])))
+        with np.errstate(divide="ignore"):
+            return np.logaddexp(
+                np.log1p(-self.epsilon) + self.base.prefix_log_prob(obs, slates),
                 np.log(self.epsilon) + uniform,
             )

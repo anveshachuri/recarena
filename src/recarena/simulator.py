@@ -119,6 +119,10 @@ class BatchSimulator:
         was_alive = self.alive
         rewards = np.zeros(n)
         clicked_item = np.full(n, -1)
+        # Which slot produced each reward and cost, kept for slate-aware estimators.
+        # Recording them draws no random numbers, so results are unchanged.
+        slot_rewards = np.zeros((n, k))
+        slot_costs = np.zeros((n, k))
 
         # An item already shown earlier in the slate is not looked at again.
         # Computed once for all slots and reused by the cascade and cost loops.
@@ -135,14 +139,18 @@ class BatchSimulator:
             clicks = self.rng.random(n) < self.click_probability(items)
             hit = browsing & looks & clicks & ~repeated[:, slot]
             rewards[hit] = self.catalog.quality[items[hit]]
+            slot_rewards[hit, slot] = rewards[hit]
             clicked_item[hit] = items[hit]
             browsing &= ~hit
 
         shown_sponsored = np.zeros(n)
         for slot in range(k):
             items = slates[:, slot]
-            shown_sponsored += self.catalog.sponsored[items] & ~repeated[:, slot]
+            new_sponsored = self.catalog.sponsored[items] & ~repeated[:, slot]
+            shown_sponsored += new_sponsored
+            slot_costs[:, slot] = np.where(was_alive, new_sponsored / k, 0.0)
         costs = np.where(was_alive, shown_sponsored / k, 0.0)
+        self.last_slot_rewards, self.last_slot_costs = slot_rewards, slot_costs
 
         # Showing a topic tires the user of it, whether or not they click.
         shown_topics = self.catalog.topics[slates].mean(axis=1)
