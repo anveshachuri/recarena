@@ -121,6 +121,23 @@ python -m recarena.stress --sizes 1000 5000 --catalogs 5 --repeats 10 --truth 50
 
 If it runs slowly, set `OPENBLAS_NUM_THREADS=1` and `OMP_NUM_THREADS=1` first, because it already runs one job per CPU core.
 
+## Does more exploration in the logs help?
+
+`UniformMixturePolicy` adds exploration to a logging policy: with chance `epsilon` it shows a uniformly random slate, and its slate probabilities stay exact. `python -m recarena.exploration` logs data with six logging policies (temperatures 0.5, 1, 2 and 4, and the default mixed with 10% or 30% uniform slates) and scores every estimator on the usual five targets. Full tables are in [`results/exploration.md`](results/exploration.md).
+
+What it found in the default world, with 50 logged datasets per cell:
+
+- **Exploring costs reward, and less than it might seem.** Mixing in 10% uniform slates cost 1.1% of the logging policy's own reward, 30% cost 3.3%, and raising the temperature to 4 cost 8.6%.
+- **None of these logging policies made the far targets much easier.** For "pushes sponsored" and "much greedier", with 5,000 sessions the effective sample size stayed between 0.5% and 2.6% of the sessions logged for every logging policy, and SNPDIS error stayed between 14.4% and 39.1%. A uniform slate here is one of 117,600, so random exploration rarely shows the slates a far target prefers.
+- **Effective sample size ranked the cells well.** Its rank correlation with RMSE was between -0.91 and -0.98 for every estimator with 5,000 sessions. Most of that comes from separating near targets from far ones; among the far cells, where it matters most, effective sample size only spanned 0.5% to 2.6% while SNPDIS error spanned 14.4% to 39.1%, so it says "be careful" more than "how wrong".
+- **Some far cells are dominated by one or two extreme runs**, for example PDIS at 874.4% ± 436.6. Treat those cells as noisy.
+
+**Limits:** one catalog, the default world, an informed model for Direct and DR, and only uniform exploration. Exploration aimed at the slates a target would show could behave very differently. Reproduce with:
+
+```bash
+python -m recarena.exploration --sizes 1000 5000 --repeats 50 --truth 500000
+```
+
 ## How it's tested
 
 The tests compare the simulator with values worked out by hand from every possible slate, check the estimators against hand-calculated answers, and confirm that doubly robust stays unbiased even with a deliberately wrong model.

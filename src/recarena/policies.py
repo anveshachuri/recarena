@@ -55,3 +55,39 @@ class SoftmaxPolicy:
             total += scores[rows, items] - denominator
             scores[rows, items] = -np.inf
         return total
+
+
+@dataclass(frozen=True)
+class UniformMixturePolicy:
+    """With chance ``epsilon`` shows a uniformly random slate, otherwise follows ``base``.
+
+    A standard way to add exploration to a logging policy. The slate probability is the
+    exact mixture ``(1 - epsilon) * base + epsilon * uniform``, so it can be logged and
+    used in importance weights like any other policy here.
+    """
+
+    base: SoftmaxPolicy
+    epsilon: float = 0.1
+    name: str = "uniform mixture"
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.epsilon <= 1.0:
+            raise ValueError(f"epsilon must be between 0 and 1, got {self.epsilon}")
+
+    def sample(self, obs: np.ndarray, slate_size: int, rng: np.random.Generator) -> np.ndarray:
+        slates = self.base.sample(obs, slate_size, rng)
+        explore = rng.random(len(obs)) < self.epsilon
+        if explore.any():
+            # Random keys sorted give a uniformly random ordered slate without replacement.
+            keys = rng.random((int(explore.sum()), self.base.catalog.quality.shape[0]))
+            slates[explore] = np.argsort(keys, axis=1)[:, :slate_size]
+        return slates
+
+    def log_prob(self, obs: np.ndarray, slates: np.ndarray) -> np.ndarray:
+        n_items = self.base.catalog.quality.shape[0]
+        uniform = -np.sum(np.log(n_items - np.arange(slates.shape[1])))
+        with np.errstate(divide="ignore"):
+            return np.logaddexp(
+                np.log1p(-self.epsilon) + self.base.log_prob(obs, slates),
+                np.log(self.epsilon) + uniform,
+            )

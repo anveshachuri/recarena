@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from gymnasium.utils.env_checker import check_env
 
-from recarena import BatchSimulator, Catalog, LoggedData, SimConfig, SlateRecEnv, SoftmaxPolicy, collect, true_value
+from recarena import BatchSimulator, Catalog, LoggedData, SimConfig, SlateRecEnv, SoftmaxPolicy, UniformMixturePolicy, collect, true_value
 from recarena.estimators import (
     FittedQ,
     direct_and_dr,
@@ -89,6 +89,60 @@ def test_sampling_matches_stated_probabilities():
         expected = np.exp(policy.log_prob(obs[:1], np.array([slate])))[0]
         seen = np.mean(np.all(slates == slate, axis=1))
         assert seen == pytest.approx(expected, abs=4 * np.sqrt(expected * (1 - expected) / n))
+
+
+def test_uniform_mixture_probabilities_match_hand_calculation_and_sum_to_one():
+    config = SimConfig(n_items=5, n_topics=2, slate_size=3)
+    catalog = Catalog.generate(config)
+    base = SoftmaxPolicy(catalog, history_weight=2.0, sponsored_weight=0.5, temperature=0.7)
+    policy = UniformMixturePolicy(base, epsilon=0.25)
+    obs = np.tile(np.array([0.2, 0.1, 0.0, 0.5]), (60, 1))
+    slates = np.array(list(itertools.permutations(range(5), 3)))
+    expected = 0.75 * np.exp(base.log_prob(obs, slates)) + 0.25 / (5 * 4 * 3)
+    assert np.exp(policy.log_prob(obs, slates)) == pytest.approx(expected)
+    assert np.exp(policy.log_prob(obs, slates)).sum() == pytest.approx(1.0)
+
+
+def test_uniform_mixture_endpoints_are_the_base_and_uniform_policies():
+    config = SimConfig(n_items=5, n_topics=2, slate_size=3)
+    catalog = Catalog.generate(config)
+    base = SoftmaxPolicy(catalog, sponsored_weight=1.0)
+    obs = np.zeros((60, 4))
+    slates = np.array(list(itertools.permutations(range(5), 3)))
+    assert UniformMixturePolicy(base, 0.0).log_prob(obs, slates) == pytest.approx(base.log_prob(obs, slates))
+    assert UniformMixturePolicy(base, 1.0).log_prob(obs, slates) == pytest.approx(np.full(60, -np.log(60.0)))
+
+
+def test_uniform_mixture_sampling_matches_stated_probabilities():
+    config = SimConfig(n_items=4, n_topics=2, slate_size=2)
+    catalog = Catalog.generate(config)
+    policy = UniformMixturePolicy(SoftmaxPolicy(catalog, sponsored_weight=1.0, temperature=0.5), epsilon=0.3)
+    n = 200_000
+    obs = np.zeros((n, 4))
+    slates = policy.sample(obs, 2, np.random.default_rng(1))
+    for slate in itertools.permutations(range(4), 2):
+        expected = np.exp(policy.log_prob(obs[:1], np.array([slate])))[0]
+        seen = np.mean(np.all(slates == slate, axis=1))
+        assert seen == pytest.approx(expected, abs=4 * np.sqrt(expected * (1 - expected) / n))
+
+
+@pytest.mark.parametrize("epsilon", [-0.1, 1.5])
+def test_uniform_mixture_rejects_epsilon_outside_zero_to_one(epsilon):
+    catalog = Catalog.generate(SMALL)
+    with pytest.raises(ValueError, match="epsilon"):
+        UniformMixturePolicy(SoftmaxPolicy(catalog), epsilon)
+
+
+def test_pdis_is_unbiased_with_a_uniform_mixture_logging_policy():
+    catalog = Catalog.generate(SHORT)
+    behavior = UniformMixturePolicy(SoftmaxPolicy(catalog), epsilon=0.2)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    truth = true_value(SHORT, catalog, target, 400_000, np.random.default_rng(9))
+    data = collect(SHORT, catalog, behavior, 400_000, np.random.default_rng(13))
+    ratios = importance_ratios(data, target)
+    scores = np.sum(np.cumprod(ratios, axis=1) * data.rewards, axis=1)
+    stderr = np.hypot(scores.std() / np.sqrt(data.n), truth.reward_stderr)
+    assert within(pdis(data, data.rewards, ratios), truth.reward, 2 * stderr)
 
 
 def test_low_temperature_stays_numerically_stable():
@@ -634,3 +688,20 @@ def test_benchmark_runs_with_a_subset_of_estimators():
     report = run([100], 1, 2000, 1.25, 1, 1, estimators=["IPS", "DR"])
     header = next(line for line in report.splitlines() if line.startswith("| Target policy | Sessions logged"))
     assert header == "| Target policy | Sessions logged | IPS | DR |"
+
+
+def test_effective_sample_share_matches_hand_calculation():
+    from recarena.exploration import effective_sample_share
+
+    assert effective_sample_share(np.ones(10)) == pytest.approx(1.0)
+    # (1 + 1 + 2)^2 / (1 + 1 + 4) / 3 = 16 / 18
+    assert effective_sample_share(np.array([1.0, 1.0, 2.0])) == pytest.approx(16 / 18)
+
+
+def test_exploration_experiment_runs_and_reports_every_logging_policy():
+    from recarena.exploration import run
+
+    report = run([100], 2, 2000, 1, 1)
+    for name in ["temperature 0.5", "temperature 4", "default + 10% uniform", "default + 30% uniform"]:
+        assert f"| {name} |" in report
+    assert "## Does effective sample size track the error?" in report

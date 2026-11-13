@@ -11,7 +11,7 @@ from .estimators import (
     estimate_all_detailed,
     register_estimator,
 )
-from .policies import SoftmaxPolicy
+from .policies import SoftmaxPolicy, UniformMixturePolicy
 from .simulator import BatchSimulator, Catalog, SimConfig
 
 __all__ = [
@@ -25,6 +25,7 @@ __all__ = [
     "SlateRecEnv",
     "SoftmaxPolicy",
     "TrueValue",
+    "UniformMixturePolicy",
     "available_estimators",
     "collect",
     "estimate_all",
