@@ -14,6 +14,7 @@ recarena is a simulator where the true answer is known. It runs each policy dire
 - **Slates:** users look down a list and stop at their first click, and they are less likely to look at lower slots.
 - **A Gymnasium environment**, `SlateRecEnv`, for training RL agents.
 - **Six estimators:** IPS, SNIPS, PDIS, SNPDIS, a direct method (fitted Q evaluation) and doubly robust.
+- **Two slate-aware estimators**, CascadePDIS and SNCascadePDIS, which you can ask for by name.
 - **Budgets:** each step reports sponsored exposure as a cost, so you can test whether an estimator can tell if a policy stays within a budget.
 
 ## Quickstart
@@ -136,6 +137,27 @@ What it found in the default world, with 50 logged datasets per cell:
 
 ```bash
 python -m recarena.exploration --sizes 1000 5000 --repeats 50 --truth 500000
+```
+
+## Do slate-aware weights help?
+
+The weighted estimators above treat a whole slate as one action. `CascadePDIS` instead weights a reward in slot j of a step by the ratio of only the first j slots of that step, times the full slate ratios of earlier steps. That is unbiased here because users read top down and stop at their first click, so a slot's reward and cost don't depend on the slots below it. Later steps can depend on the whole slate (fatigue, leaving), so earlier steps still pay for full slates. `SNCascadePDIS` normalizes the weights for each step and slot. Both follow the cascade idea of Kiyohara et al. (2022) and McInerney et al. (2020), applied per step of a session. They are opt in, so default results don't change:
+
+```python
+estimate_all(logs, logs.rewards, new, config.examine_decay, rng, estimators=["SNPDIS", "CascadePDIS", "SNCascadePDIS"])
+```
+
+`python -m recarena.slate_estimators` compares them with PDIS and SNPDIS across slate sizes and session lengths. Full tables are in [`results/slate_estimators.md`](results/slate_estimators.md). What it found, with 200 logged datasets per cell (RMSE as a share of the true value):
+
+- **In one-step sessions, the gain grows with slate size.** For the two far targets with 5,000 sessions, CascadePDIS cut PDIS error from 5.4% to 4.4% and 4.5% to 4.1% with slates of 2, and from 8.2% to 5.0% and 6.5% to 4.1% with slates of 5.
+- **In 20-step sessions, most of that gain disappears.** The full slate ratios of earlier steps dominate the weight. With slates of 3 and 5,000 sessions, SNCascadePDIS improved on SNPDIS only from 19.7% to 17.9% and from 17.1% to 15.2%. Unnormalized CascadePDIS was sometimes worse than PDIS (29.7% ± 5.6 against 27.3% ± 3.0 for "much greedier"), within noise.
+- **Near targets don't change.** All four estimators agree to within 0.2 points.
+- **Far targets in long sessions show a large average error even for the unbiased estimators** (for example between -12.3% and -16.2% for all four estimators on "much greedier" with slates of 5 and 5,000 sessions). A likely reason, not yet checked, is that the weights are so heavy tailed that 200 datasets rarely include the huge weights that make the average come out right.
+
+**Limits:** one catalog, the default world, the default logging policy, rewards only (costs are supported but weren't scored here), and only the cascade estimator. The pseudoinverse estimator and independent or position-based IPS from #13 aren't implemented. Reproduce with:
+
+```bash
+python -m recarena.slate_estimators --slate-sizes 2 3 5 --horizons 1 20 --sizes 1000 5000 --repeats 200 --truth 500000
 ```
 
 ## How it's tested

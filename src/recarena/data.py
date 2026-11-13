@@ -18,6 +18,10 @@ class LoggedData:
     costs: np.ndarray  # (n, horizon)
     active: np.ndarray  # (n, horizon), True while the user is still in the session.
     behavior_log_prob: np.ndarray  # (n, horizon)
+    # Optional, for slate-aware estimators. ``collect`` fills them in.
+    slot_rewards: np.ndarray | None = None  # (n, horizon, slate_size), the reward each slot produced.
+    slot_costs: np.ndarray | None = None  # (n, horizon, slate_size), the cost each slot added.
+    behavior_prefix_log_prob: np.ndarray | None = None  # (n, horizon, slate_size)
 
     @property
     def n(self) -> int:
@@ -28,6 +32,9 @@ class LoggedData:
         return self.obs.shape[1]
 
     def subset(self, index: np.ndarray) -> "LoggedData":
+        def pick(array):
+            return None if array is None else array[index]
+
         return LoggedData(
             self.obs[index],
             self.slates[index],
@@ -35,6 +42,9 @@ class LoggedData:
             self.costs[index],
             self.active[index],
             self.behavior_log_prob[index],
+            pick(self.slot_rewards),
+            pick(self.slot_costs),
+            pick(self.behavior_prefix_log_prob),
         )
 
 
@@ -51,6 +61,9 @@ def collect(
         costs=np.zeros((n, h)),
         active=np.zeros((n, h), dtype=bool),
         behavior_log_prob=np.zeros((n, h)),
+        slot_rewards=np.zeros((n, h, k)),
+        slot_costs=np.zeros((n, h, k)),
+        behavior_prefix_log_prob=np.zeros((n, h, k)),
     )
     alive = np.ones(n, dtype=bool)
     for t in range(h):
@@ -59,9 +72,12 @@ def collect(
         data.slates[:, t] = slates
         data.active[:, t] = alive
         data.behavior_log_prob[:, t] = policy.log_prob(obs, slates)
+        data.behavior_prefix_log_prob[:, t] = policy.prefix_log_prob(obs, slates)
         rewards, costs, next_alive = sim.step(slates)
         data.rewards[:, t] = rewards
         data.costs[:, t] = costs
+        data.slot_rewards[:, t] = sim.last_slot_rewards
+        data.slot_costs[:, t] = sim.last_slot_costs
         alive = next_alive
         obs = sim.observe()
     return data

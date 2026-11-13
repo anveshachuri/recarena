@@ -705,3 +705,210 @@ def test_exploration_experiment_runs_and_reports_every_logging_policy():
     for name in ["temperature 0.5", "temperature 4", "default + 10% uniform", "default + 30% uniform"]:
         assert f"| {name} |" in report
     assert "## Does effective sample size track the error?" in report
+
+
+# ---------------------------------------------------------------------------
+# Slate-aware estimators (issue #13)
+# ---------------------------------------------------------------------------
+
+from recarena.estimators import SLATE_AWARE_NAMES, _cascade_pdis, _sn_cascade_pdis, prefix_ratios  # noqa: E402
+
+
+def test_prefix_probabilities_match_hand_calculation():
+    catalog = Catalog.generate(SMALL)
+    policy = SoftmaxPolicy(catalog, quality_weight=2.0)
+    obs = np.zeros((1, SMALL.n_topics + 2))
+    weights = np.exp(policy.scores(obs)[0])
+    slate = np.array([[2, 0]])
+    first = weights[2] / weights.sum()
+    second = weights[0] / (weights.sum() - weights[2])
+    assert np.exp(policy.prefix_log_prob(obs, slate)[0]) == pytest.approx([first, first * second])
+
+    mixture = UniformMixturePolicy(policy, 0.25)
+    expected = [0.75 * first + 0.25 / 4, 0.75 * first * second + 0.25 / (4 * 3)]
+    assert np.exp(mixture.prefix_log_prob(obs, slate)[0]) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("kind", ["softmax", "mixture"])
+def test_whole_prefix_is_the_slate_probability_and_first_slots_sum_to_one(kind):
+    config = SimConfig(n_items=6, n_topics=2, slate_size=3, horizon=1, catalog_seed=4)
+    catalog = Catalog.generate(config)
+    policy = SoftmaxPolicy(catalog, temperature=0.5)
+    if kind == "mixture":
+        policy = UniformMixturePolicy(policy, 0.3)
+    obs = np.random.default_rng(0).random((5, config.n_topics + 2))
+    slates = np.array(list(itertools.permutations(range(config.n_items), config.slate_size)))
+    for row in obs:
+        repeated = np.tile(row, (len(slates), 1))
+        prefix = policy.prefix_log_prob(repeated, slates)
+        assert prefix[:, -1] == pytest.approx(policy.log_prob(repeated, slates))
+        firsts = dict(zip(slates[:, 0], np.exp(prefix[:, 0])))
+        assert sum(firsts.values()) == pytest.approx(1.0)
+
+
+def test_collect_logs_where_each_reward_and_cost_came_from():
+    catalog = Catalog.generate(SHORT)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 3000, np.random.default_rng(40))
+    assert np.allclose(data.slot_rewards.sum(axis=2), data.rewards)
+    assert np.allclose(data.slot_costs.sum(axis=2), data.costs)
+    assert np.allclose(data.behavior_prefix_log_prob[:, :, -1], data.behavior_log_prob)
+    # At most one slot pays off per step, and its reward is the clicked item's quality.
+    paid = data.slot_rewards > 0
+    assert paid.sum(axis=2).max() == 1
+    assert data.slot_rewards[paid] == pytest.approx(catalog.quality[data.slates[paid]])
+    assert np.all(data.slot_costs[~data.active] == 0)
+    first_ten = data.subset(np.arange(10))
+    assert np.array_equal(first_ten.slot_costs, data.slot_costs[:10])
+
+
+def test_recording_slots_draws_no_extra_random_numbers():
+    """Replays the simulator by hand with the same seed. Any extra draw would change the logs."""
+    catalog = Catalog.generate(SHORT)
+    policy = SoftmaxPolicy(catalog)
+    data = collect(SHORT, catalog, policy, 200, np.random.default_rng(41))
+    rng = np.random.default_rng(41)
+    sim = BatchSimulator(SHORT, catalog, 200, rng)
+    obs = sim.reset()
+    for t in range(SHORT.horizon):
+        slates = policy.sample(obs, SHORT.slate_size, rng)
+        rewards, costs, _ = sim.step(slates)
+        assert np.array_equal(slates, data.slates[:, t])
+        assert np.array_equal(rewards, data.rewards[:, t])
+        assert np.array_equal(costs, data.costs[:, t])
+        obs = sim.observe()
+
+
+def handmade_slot_task():
+    data, ratios = handmade_data()
+    slot_rewards = np.zeros((2, 3, 2))
+    slot_rewards[0, 0, 0], slot_rewards[0, 1, 1], slot_rewards[0, 2, 0] = 1.0, 2.0, 3.0
+    slot_rewards[1, 0, 1] = 4.0
+    task = EstimationTask(data, data.rewards, None, 1.0, np.random.default_rng(0), slot_values=slot_rewards)
+    task.ratios = ratios
+    # Ratios for the first slot only. The second slot's ratio is the whole slate's.
+    first = np.array([[4.0, 1.0, 1.5], [0.25, 1.0, 1.0]])
+    task.prefix_ratios = np.stack([first, ratios], axis=2)
+    return task, slot_rewards
+
+
+def test_cascade_estimators_match_hand_calculations():
+    task, values = handmade_slot_task()
+    # Session one: 1 * 4 * 1 (step 1, slot 1) + 2 * 0.5 * 2 (step 2, slot 2) + (2 * 0.5) * 1.5 * 3 (step 3, slot 1).
+    # Session two: 1 * 0.5 * 4 (step 1, slot 2).
+    result = _cascade_pdis(task)
+    assert result.value == pytest.approx((10.5 + 2.0) / 2)
+    assert result.influence == pytest.approx([4.25, -4.25])
+
+    weights = np.array(
+        [
+            [[4.0, 2.0], [2.0, 1.0], [1.5, 3.0]],
+            [[0.25, 0.5], [0.5, 0.5], [0.5, 0.5]],
+        ]
+    )
+    cells = (weights * values).sum(axis=0) / weights.sum(axis=0)
+    assert cells.sum() == pytest.approx(4 / 4.25 + 2 / 2.5 + 2 / 1.5 + 4.5 / 2)
+    expected = (weights * (values - cells) / weights.mean(axis=0)).sum(axis=(1, 2))
+    sn = _sn_cascade_pdis(task)
+    assert sn.value == pytest.approx(cells.sum())
+    assert sn.influence == pytest.approx(expected)
+
+
+def test_cascade_pdis_is_pdis_when_every_value_sits_in_the_last_slot():
+    from recarena.estimators import _pdis, _snpdis
+
+    task, _ = handmade_slot_task()
+    last_slot = np.zeros((2, 3, 2))
+    last_slot[:, :, -1] = task.values
+    task.slot_values = last_slot
+    assert _cascade_pdis(task).value == pytest.approx(_pdis(task).value)
+    assert _sn_cascade_pdis(task).value == pytest.approx(_snpdis(task).value)
+
+
+def test_cascade_estimators_are_on_policy_means_when_target_is_logging():
+    catalog = Catalog.generate(SHORT)
+    policy = SoftmaxPolicy(catalog)
+    data = collect(SHORT, catalog, policy, 500, np.random.default_rng(42))
+    assert np.allclose(prefix_ratios(data, policy), 1.0)
+    results = estimate_all(data, data.costs, policy, SHORT.examine_decay, np.random.default_rng(0), estimators=SLATE_AWARE_NAMES)
+    for value in results.values():
+        assert value == pytest.approx(data.costs.sum(axis=1).mean())
+
+
+def test_cascade_pdis_recovers_exact_one_step_value_with_less_noise_than_pdis():
+    catalog = Catalog.generate(SMALL)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, quality_weight=2.0)
+    data = collect(SMALL, catalog, behavior, 400_000, np.random.default_rng(43))
+    results = estimate_all_detailed(
+        data, data.rewards, target, SMALL.examine_decay, np.random.default_rng(0), estimators=["PDIS", "CascadePDIS"]
+    )
+    cascade = results["CascadePDIS"]
+    assert within(cascade.value, exact_one_step_value(SMALL, catalog, target), cascade.standard_error())
+    assert cascade.standard_error() < results["PDIS"].standard_error()
+
+
+@pytest.mark.parametrize("which", ["reward", "cost"])
+def test_cascade_pdis_recovers_multi_step_truth(which):
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5, sponsored_weight=1.0)
+    truth = true_value(SHORT, catalog, target, 400_000, np.random.default_rng(44))
+    data = collect(SHORT, catalog, behavior, 400_000, np.random.default_rng(45))
+    values = data.rewards if which == "reward" else data.costs
+    estimate = estimate_all_detailed(
+        data, values, target, SHORT.examine_decay, np.random.default_rng(0), estimators=["CascadePDIS"]
+    )["CascadePDIS"]
+    true = truth.reward if which == "reward" else truth.cost
+    true_stderr = truth.reward_stderr if which == "reward" else truth.cost_stderr
+    assert within(estimate.value, true, np.hypot(estimate.standard_error(), true_stderr))
+
+
+def test_slate_aware_estimators_are_opt_in_and_protected():
+    assert set(SLATE_AWARE_NAMES) <= set(available_estimators())
+    assert not set(SLATE_AWARE_NAMES) & set(resolve_estimators(None))
+    with pytest.raises(ValueError, match="can't be replaced"):
+        register_estimator("CascadePDIS", lambda task: 0.0, overwrite=True)
+
+
+def test_cascade_estimators_need_per_slot_values():
+    catalog = Catalog.generate(SHORT)
+    policy = SoftmaxPolicy(catalog)
+    data = collect(SHORT, catalog, policy, 200, np.random.default_rng(46))
+    other = data.rewards + data.costs
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="per-slot values"):
+        estimate_all(data, other, policy, SHORT.examine_decay, rng, estimators=["CascadePDIS"])
+    with pytest.raises(ValueError, match="sum over slots"):
+        estimate_all(data, other, policy, SHORT.examine_decay, rng, estimators=["CascadePDIS"], slot_values=data.slot_rewards)
+    # Matching per-slot values work for any combination of outcomes.
+    combined = estimate_all(
+        data, other, policy, SHORT.examine_decay, rng, estimators=["CascadePDIS"], slot_values=data.slot_rewards + data.slot_costs
+    )
+    assert combined["CascadePDIS"] == pytest.approx(other.sum(axis=1).mean())
+
+
+def test_slate_estimator_experiment_runs_and_reports_every_world():
+    from recarena.slate_estimators import run
+
+    report = run([2, 3], [1, 2], [100], 2, 2000, 1, 1)
+    for k, h in [(2, 1), (2, 2), (3, 1), (3, 2)]:
+        assert f"### Slates of {k}, sessions up to {h} steps, 100 sessions logged" in report
+    assert "| Target policy | PDIS | SNPDIS | CascadePDIS | SNCascadePDIS |" in report
+
+
+def test_sn_cascade_delta_method_standard_error_matches_the_bootstrap():
+    catalog = Catalog.generate(SHORT)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 5000, np.random.default_rng(47))
+    rng = np.random.default_rng(48)
+    full = EstimationTask(data, data.rewards, target, SHORT.examine_decay, rng)
+    result = _sn_cascade_pdis(full)
+    boot = []
+    for _ in range(400):
+        index = rng.integers(0, data.n, data.n)
+        part = data.subset(index)
+        task = EstimationTask(part, part.rewards, target, SHORT.examine_decay, rng)
+        task.ratios, task.prefix_ratios = full.ratios[index], full.prefix_ratios[index]
+        boot.append(_sn_cascade_pdis(task).value)
+    # A standard deviation from 400 draws has a relative standard error of about 1/sqrt(800), 3.5%.
+    assert result.standard_error() == pytest.approx(np.std(boot, ddof=1), rel=4 / np.sqrt(800))
