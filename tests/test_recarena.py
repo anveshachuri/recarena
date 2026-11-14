@@ -947,3 +947,17 @@ def test_linked_appeal_experiment_runs_and_reports_every_world():
     for w in WORLDS:
         assert f"## {w.name} (100 sessions)" in report
         assert f"| {w.name} | Direct |" in report
+
+
+def test_direct_reports_no_plug_in_standard_error():
+    """Issue #22: Direct's per-session scores barely vary, so a plug-in standard error was about 30 times too small."""
+    catalog = Catalog.generate(SHORT)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 2000, np.random.default_rng(40))
+    results = estimate_all_detailed(data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(41))
+    assert results["Direct"].influence is None
+    assert np.isnan(results["Direct"].standard_error())
+    assert np.isfinite(results["Direct"].value)
+    for name in ("IPS", "SNIPS", "PDIS", "SNPDIS", "DR"):
+        assert results[name].influence is not None, name
+        assert np.isfinite(results[name].standard_error()), name

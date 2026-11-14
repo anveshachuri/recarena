@@ -312,8 +312,11 @@ def _snpdis(task: EstimationTask) -> Estimate:
 
 
 def _direct(task: EstimationTask) -> Estimate:
-    # The influence treats the fitted models as fixed, so intervals from it ignore model-fitting noise.
-    return _mean_estimate(task.model_scores()[0])
+    # No influence values. Every session starts from nearly the same state, so the per-session
+    # scores barely vary, and their spread says almost nothing about how much the estimate would
+    # change on new data, which is mostly model-fitting noise (see issue #22). Reporting them
+    # gave standard errors about 30 times too small.
+    return Estimate(float(task.model_scores()[0].mean()))
 
 
 def _dr(task: EstimationTask) -> Estimate:
