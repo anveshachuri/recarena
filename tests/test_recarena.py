@@ -912,3 +912,15 @@ def test_sn_cascade_delta_method_standard_error_matches_the_bootstrap():
         boot.append(_sn_cascade_pdis(task).value)
     # A standard deviation from 400 draws has a relative standard error of about 1/sqrt(800), 3.5%.
     assert result.standard_error() == pytest.approx(np.std(boot, ddof=1), rel=4 / np.sqrt(800))
+def test_direct_reports_no_plug_in_standard_error():
+    """Issue #22: Direct's per-session scores barely vary, so a plug-in standard error was about 30 times too small."""
+    catalog = Catalog.generate(SHORT)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 2000, np.random.default_rng(40))
+    results = estimate_all_detailed(data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(41))
+    assert results["Direct"].influence is None
+    assert np.isnan(results["Direct"].standard_error())
+    assert np.isfinite(results["Direct"].value)
+    for name in ("IPS", "SNIPS", "PDIS", "SNPDIS", "DR"):
+        assert results[name].influence is not None, name
+        assert np.isfinite(results[name].standard_error()), name

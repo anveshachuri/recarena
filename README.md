@@ -64,7 +64,7 @@ results = estimate_all_detailed(logs, logs.rewards, new, config.examine_decay, r
 print({name: (round(r.value, 3), round(r.standard_error(), 3)) for name, r in results.items()})
 ```
 
-The second part of an `Estimate` is each session's influence on the estimate. Confidence intervals are built from it, and every built-in estimator provides it. The benchmark and stress test take `--estimators` to choose which to run. To use your own estimator there, pass the function itself to `run(..., estimators={"Clipped IPS": clipped_ips})` from a module it can be imported from.
+The second part of an `Estimate` is each session's influence on the estimate. Confidence intervals are built from it. Every built-in estimator except Direct provides it. Direct's per-session scores barely vary because sessions start from nearly the same state, so its `standard_error()` is NaN rather than misleadingly small (see #22). The benchmark and stress test take `--estimators` to choose which to run. To use your own estimator there, pass the function itself to `run(..., estimators={"Clipped IPS": clipped_ips})` from a module it can be imported from.
 
 Or train an agent:
 
