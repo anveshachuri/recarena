@@ -912,3 +912,38 @@ def test_sn_cascade_delta_method_standard_error_matches_the_bootstrap():
         boot.append(_sn_cascade_pdis(task).value)
     # A standard deviation from 400 draws has a relative standard error of about 1/sqrt(800), 3.5%.
     assert result.standard_error() == pytest.approx(np.std(boot, ddof=1), rel=4 / np.sqrt(800))
+
+
+def test_appeal_quality_link_matches_hand_calculation_and_keeps_the_rest_of_the_catalog():
+    """Issue #9: linked appeal mixes standardized quality with the same unlinked draws."""
+    plain = Catalog.generate(SimConfig(catalog_seed=3))
+    linked = Catalog.generate(SimConfig(catalog_seed=3, appeal_quality_link=0.6))
+    standardized = (plain.quality - plain.quality.mean()) / plain.quality.std()
+    np.testing.assert_allclose(linked.appeal, 0.6 * standardized + 0.8 * plain.appeal)
+    np.testing.assert_array_equal(linked.topics, plain.topics)
+    np.testing.assert_array_equal(linked.quality, plain.quality)
+    np.testing.assert_array_equal(linked.sponsored, plain.sponsored)
+    full = Catalog.generate(SimConfig(catalog_seed=3, appeal_quality_link=-1.0))
+    np.testing.assert_allclose(np.corrcoef(full.appeal, full.quality)[0, 1], -1.0)
+
+
+def test_appeal_sponsored_shift_moves_only_sponsored_items():
+    plain = Catalog.generate(SimConfig(catalog_seed=3))
+    shifted = Catalog.generate(SimConfig(catalog_seed=3, appeal_sponsored_shift=1.5))
+    assert plain.sponsored.any() and not plain.sponsored.all()
+    np.testing.assert_allclose(shifted.appeal - plain.appeal, 1.5 * plain.sponsored)
+
+
+@pytest.mark.parametrize("link", [-1.01, 1.5])
+def test_simconfig_rejects_appeal_quality_link_outside_minus_one_to_one(link):
+    with pytest.raises(ValueError, match="appeal_quality_link"):
+        SimConfig(appeal_quality_link=link)
+
+
+def test_linked_appeal_experiment_runs_and_reports_every_world():
+    from recarena.linked_appeal import WORLDS, run
+
+    report = run(catalogs=1, sizes=[100], repeats=2, truth_runs=500, seed=0, workers=1, estimators=["SNPDIS", "Direct"])
+    for w in WORLDS:
+        assert f"## {w.name} (100 sessions)" in report
+        assert f"| {w.name} | Direct |" in report

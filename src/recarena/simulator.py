@@ -33,6 +33,11 @@ class SimConfig:
     fixed_interest: tuple[float, ...] | None = None
     # How much each item's unlogged appeal moves its click chance. Policies never see it.
     hidden_appeal: float = 0.0
+    # Correlation between hidden appeal and item quality, from -1 to 1. Policies that favor
+    # quality then also change the hidden effect (issue #9).
+    appeal_quality_link: float = 0.0
+    # Added to the hidden appeal of sponsored items, in standard deviations of appeal.
+    appeal_sponsored_shift: float = 0.0
     # Extra chance of leaving after a miss, per unit of sponsored share in the slate.
     sponsored_annoyance: float = 0.0
 
@@ -48,6 +53,8 @@ class SimConfig:
                 f"fixed_interest length ({len(self.fixed_interest)}) must equal "
                 f"n_topics ({self.n_topics})"
             )
+        if not -1.0 <= self.appeal_quality_link <= 1.0:
+            raise ValueError(f"appeal_quality_link must be between -1 and 1, got {self.appeal_quality_link}")
 
 
 @dataclass(frozen=True)
@@ -55,17 +62,23 @@ class Catalog:
     topics: np.ndarray  # (n_items, n_topics), each row sums to 1.
     quality: np.ndarray  # (n_items,), reward for a click, in (0, 1).
     sponsored: np.ndarray  # (n_items,), boolean.
-    appeal: np.ndarray  # (n_items,), standard normal, hidden from policies and models.
+    appeal: np.ndarray  # (n_items,), mean 0 and variance 1 unless linked, hidden from policies and models.
 
     @classmethod
     def generate(cls, config: SimConfig) -> "Catalog":
         rng = np.random.default_rng(config.catalog_seed)
-        return cls(
-            topics=rng.dirichlet(np.full(config.n_topics, 0.3), config.n_items),
-            quality=rng.beta(2.0, 2.0, config.n_items),
-            sponsored=rng.random(config.n_items) < config.sponsored_share,
-            appeal=rng.standard_normal(config.n_items),
-        )
+        topics = rng.dirichlet(np.full(config.n_topics, 0.3), config.n_items)
+        quality = rng.beta(2.0, 2.0, config.n_items)
+        sponsored = rng.random(config.n_items) < config.sponsored_share
+        appeal = rng.standard_normal(config.n_items)
+        # The links reuse the same random draws, so with both at 0 every catalog is unchanged.
+        if config.appeal_quality_link != 0.0:
+            link = config.appeal_quality_link
+            standardized = (quality - quality.mean()) / quality.std()
+            appeal = link * standardized + np.sqrt(1.0 - link**2) * appeal
+        if config.appeal_sponsored_shift != 0.0:
+            appeal = appeal + config.appeal_sponsored_shift * sponsored
+        return cls(topics=topics, quality=quality, sponsored=sponsored, appeal=appeal)
 
 
 def observation_size(config: SimConfig) -> int:

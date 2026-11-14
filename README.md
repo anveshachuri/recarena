@@ -112,7 +112,7 @@ What this suggests so far:
 - **Reward accuracy doesn't guarantee budget accuracy.** With the uninformed model, the direct method's median error on the sponsored policy's reward was only 2.2%, but it got just 55% of budget decisions right across the far policies, because it can't see which items are sponsored.
 - **Doubly robust is usually fine and occasionally terrible.** Its typical error was far below its RMSE, which a few extreme runs dominate. For example, its median error on one policy was 13.6%, while its RMSE was 118.4%.
 
-**Limits of these results:** this is one simulator with settings chosen by its author, and the hidden effects used here may be too mild. The hidden appeal, for example, isn't related to anything the policies favor. The large errors are also noisy with this few runs. These results need more scenarios and independent checking.
+**Limits of these results:** this is one simulator with settings chosen by its author, and the hidden effects used here may be too mild. The hidden appeal, for example, isn't related to anything the policies favor (see the linked appeal section below for what happens when it is). The large errors are also noisy with this few runs. These results need more scenarios and independent checking.
 
 Full tables are in [`results/stress_test.md`](results/stress_test.md), and an earlier single-catalog run is in [`results/first_benchmark.md`](results/first_benchmark.md). Reproduce the stress test with:
 
@@ -158,6 +158,20 @@ estimate_all(logs, logs.rewards, new, config.examine_decay, rng, estimators=["SN
 
 ```bash
 python -m recarena.slate_estimators --slate-sizes 2 3 5 --horizons 1 20 --sizes 1000 5000 --repeats 200 --truth 500000
+```
+
+## What if hidden appeal follows what policies favor?
+
+In the stress test, hidden item appeal is unrelated to anything a policy scores. Two settings, both off by default, link it: `appeal_quality_link` sets the correlation between appeal and item quality (from -1 to 1), and `appeal_sponsored_shift` adds to the appeal of sponsored items. Both reuse the same random draws, so with both at 0 every catalog is unchanged. `python -m recarena.linked_appeal` scores every built-in estimator in six worlds with the informed model. Full tables are in [`results/linked_appeal.md`](results/linked_appeal.md). What it found, with 5,000 sessions and 100 logged datasets per cell over 5 catalogs (mean error as a share of the true value, ± Monte Carlo standard error):
+
+- **Linking appeal moved Direct's bias by a few points but didn't break it.** For "much greedier", Direct's mean error was +0.3% ± 0.2 with no hidden appeal and +3.4% ± 0.3 with unrelated appeal. It fell to -0.0% ± 0.3 when appeal followed quality and rose to +5.1% ± 0.3 when appeal ran against quality. For "pushes sponsored", it was +0.7% ± 0.3 with unrelated appeal and +2.3% ± 0.3 when sponsored items were more appealing.
+- **Direct stayed the most accurate on far targets in every world** (RMSE under 6% of the true value, against 15% to 25% for SNPDIS and 22% or more for DR). A likely reason, not checked, is that the informed model already has quality and sponsorship as features, so it can absorb part of a link to them.
+- **The weighted estimators don't depend on appeal, but their far target errors still moved between worlds** (SNPDIS mean error on "much greedier" from -2.6% ± 1.8 to -10.8% ± 1.5), because the true values and weights change with the world. This fits the heavy tailed weights in #24.
+
+**Limits:** one link strength each (0.7 and a shift of 1), 5,000 sessions only, rewards only, and only the informed model. A link to something the model can't see, such as a hidden item feature that the target policy reads, would be a harder test. Reproduce with:
+
+```bash
+python -m recarena.linked_appeal --catalogs 5 --sizes 5000 --repeats 20 --truth 200000
 ```
 
 ## How it's tested
