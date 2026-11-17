@@ -961,3 +961,88 @@ def test_direct_reports_no_plug_in_standard_error():
     for name in ("IPS", "SNIPS", "PDIS", "SNPDIS", "DR"):
         assert results[name].influence is not None, name
         assert np.isfinite(results[name].standard_error()), name
+
+
+def test_collect_with_logged_policy_keeps_sessions_and_records_its_probabilities():
+    """Issue #20: logs whose probabilities come from a different policy than the one that acted."""
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    wrong = SoftmaxPolicy(catalog, temperature=1.3, history_weight=0.5)
+    plain = collect(SHORT, catalog, behavior, 300, np.random.default_rng(9))
+    relogged = collect(SHORT, catalog, behavior, 300, np.random.default_rng(9), logged_policy=wrong)
+    for name in ("obs", "slates", "rewards", "costs", "active", "slot_rewards", "slot_costs"):
+        np.testing.assert_array_equal(getattr(relogged, name), getattr(plain, name), err_msg=name)
+    n, h, k = plain.slates.shape
+    flat_obs, flat_slates = plain.obs.reshape(n * h, -1), plain.slates.reshape(n * h, k)
+    np.testing.assert_allclose(relogged.behavior_log_prob, wrong.log_prob(flat_obs, flat_slates).reshape(n, h))
+    np.testing.assert_allclose(relogged.behavior_prefix_log_prob, wrong.prefix_log_prob(flat_obs, flat_slates).reshape(n, h, k))
+    assert not np.allclose(relogged.behavior_log_prob, plain.behavior_log_prob)
+
+
+def test_relog_with_the_acting_policy_reproduces_the_logs():
+    from recarena import relog
+
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    data = collect(SHORT, catalog, behavior, 200, np.random.default_rng(10))
+    again = relog(data, behavior)
+    np.testing.assert_array_equal(again.behavior_log_prob, data.behavior_log_prob)
+    np.testing.assert_array_equal(again.behavior_prefix_log_prob, data.behavior_prefix_log_prob)
+
+
+def test_plackett_luce_likelihood_matches_softmax_policy_log_prob():
+    from recarena.propensity_error import FEATURES, _item_features, _plackett_luce
+
+    catalog = Catalog.generate(SHORT)
+    policy = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5, sponsored_weight=-0.5)
+    data = collect(SHORT, catalog, policy, 200, np.random.default_rng(11))
+    obs, slates = data.obs.reshape(-1, data.obs.shape[2]), data.slates.reshape(-1, SHORT.slate_size)
+    loglik, _, _ = _plackett_luce(_item_features(catalog, obs, FEATURES), slates, np.array([2.0, 1.5, -0.5]))
+    assert loglik == pytest.approx(policy.log_prob(obs, slates).sum())
+
+
+def test_fit_softmax_policy_finds_the_maximum_likelihood_weights():
+    from recarena.propensity_error import FEATURES, _item_features, _plackett_luce, fit_softmax_policy
+
+    catalog = Catalog.generate(SHORT)
+    truth = np.array([2.0, 1.5, -0.5])
+    policy = SoftmaxPolicy(catalog, history_weight=truth[0], quality_weight=truth[1], sponsored_weight=truth[2])
+    data = collect(SHORT, catalog, policy, 4000, np.random.default_rng(12))
+    fitted = fit_softmax_policy(catalog, data)
+    theta = np.array([fitted.history_weight, fitted.quality_weight, fitted.sponsored_weight])
+    active = data.active.reshape(-1)
+    x = _item_features(catalog, data.obs.reshape(-1, data.obs.shape[2])[active], FEATURES)
+    slates = data.slates.reshape(-1, SHORT.slate_size)[active]
+    loglik, grad, hess = _plackett_luce(x, slates, theta)
+    assert loglik >= _plackett_luce(x, slates, truth)[0]
+    np.testing.assert_allclose(grad, 0.0, atol=1e-6)
+    # The inverse of the negative Hessian is the usual standard error of a maximum likelihood fit.
+    se = np.sqrt(np.diag(np.linalg.inv(-hess)))
+    assert np.all(np.abs(theta - truth) < 4 * se), (theta, truth, se)
+    quality_only = fit_softmax_policy(catalog, data, ("quality",))
+    assert quality_only.history_weight == 0.0 and quality_only.sponsored_weight == 0.0
+    with pytest.raises(ValueError, match="unknown features"):
+        fit_softmax_policy(catalog, data, ("appeal",))
+
+
+def test_flag_statistic_is_quiet_with_exact_probabilities_and_flags_a_wrong_temperature():
+    from recarena import relog
+    from recarena.propensity_error import flag_statistic
+
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    data = collect(SHORT, catalog, behavior, 3000, np.random.default_rng(13))
+    assert abs(flag_statistic(data, target)) < 3
+    assert flag_statistic(data, behavior) == 0.0
+    wrong = relog(data, SoftmaxPolicy(catalog, temperature=1.5))
+    assert abs(flag_statistic(wrong, target)) > 3
+
+
+def test_propensity_error_experiment_runs_and_reports_every_kind_of_error():
+    from recarena.propensity_error import ERRORS, run
+
+    report = run(sizes=[100], repeats=2, truth_runs=500, seed=0, workers=1, estimators=["SNPDIS", "Direct"])
+    for e in ERRORS:
+        assert f"| {e.name} |" in report
+    assert "## Warning sign: share of datasets flagged (100 sessions)" in report

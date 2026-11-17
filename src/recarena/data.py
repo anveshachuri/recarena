@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -49,8 +49,19 @@ class LoggedData:
 
 
 def collect(
-    config: SimConfig, catalog: Catalog, policy: SoftmaxPolicy, n: int, rng: np.random.Generator
+    config: SimConfig,
+    catalog: Catalog,
+    policy: SoftmaxPolicy,
+    n: int,
+    rng: np.random.Generator,
+    logged_policy: SoftmaxPolicy | None = None,
 ) -> LoggedData:
+    """Runs ``policy`` for ``n`` sessions and logs what it did.
+
+    The logged probabilities come from ``policy`` unless ``logged_policy`` is given, which
+    mimics logs whose probabilities are estimated or slightly wrong (issue #20). It uses no
+    random numbers, so the sessions are the same either way.
+    """
     sim = BatchSimulator(config, catalog, n, rng)
     obs = sim.reset()
     h, k = config.horizon, config.slate_size
@@ -80,7 +91,21 @@ def collect(
         data.slot_costs[:, t] = sim.last_slot_costs
         alive = next_alive
         obs = sim.observe()
+    if logged_policy is not None:
+        data = relog(data, logged_policy)
     return data
+
+
+def relog(data: LoggedData, policy) -> LoggedData:
+    """The same sessions, with logged probabilities recomputed as if ``policy`` had acted."""
+    n, h, k = data.slates.shape
+    flat_obs = data.obs.reshape(n * h, -1)
+    flat_slates = data.slates.reshape(n * h, k)
+    return replace(
+        data,
+        behavior_log_prob=policy.log_prob(flat_obs, flat_slates).reshape(n, h),
+        behavior_prefix_log_prob=policy.prefix_log_prob(flat_obs, flat_slates).reshape(n, h, k),
+    )
 
 
 @dataclass(frozen=True)

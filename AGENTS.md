@@ -25,6 +25,7 @@ The full stress test takes a long time. Don't run it unless the task needs it.
 | `src/recarena/exploration.py` | How the logging policy's exploration level changes estimator error (#17) |
 | `src/recarena/slate_estimators.py` | Slate-aware (cascade) estimators against plain per-decision IS (#13) |
 | `src/recarena/linked_appeal.py` | Hidden appeal linked to quality or sponsorship (#9) |
+| `src/recarena/propensity_error.py` | Estimators when the logged probabilities are slightly wrong or fitted from the logs (#20) |
 | `tests/test_recarena.py` | Hand calculations and statistical checks |
 
 ## Rules that are easy to break

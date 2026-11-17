@@ -174,6 +174,23 @@ In the stress test, hidden item appeal is unrelated to anything a policy scores.
 python -m recarena.linked_appeal --catalogs 5 --sizes 5000 --repeats 20 --truth 200000
 ```
 
+## What if the logged probabilities are slightly wrong?
+
+Every weighting estimator divides by the logging policy's probabilities, and `collect` records them exactly. Outside a simulator they are often estimated. `collect(..., logged_policy=other)` and `relog(logs, other)` record another policy's probabilities for the same sessions, and `recarena.propensity_error.fit_softmax_policy` fits a softmax policy to logged slates by maximum likelihood. `python -m recarena.propensity_error` scores every estimator with nine versions of the logged probabilities: exact, temperature 0.8 to 1.2 (the truth is 1), history weight 0.8 or 1.2 (the truth is 1), and policies fitted to the logs with all three features or with quality only. Full tables are in [`results/propensity_error.md`](results/propensity_error.md). What it found in the default world, with 100 datasets of 5,000 sessions (shift = estimate with wrong probabilities minus estimate with exact ones on the same data, in percent of the true value, ± Monte Carlo standard error):
+
+- **A 10% temperature error moves near targets by a few points, and IPS most.** For "slightly different" with temperature 1.1, IPS shifted by +7.0% ± 0.0, PDIS by +3.3% ± 0.0 and SNPDIS by +1.5% ± 0.0. With temperature 1.2 the shifts were +16.5%, +7.4% and +3.0%. That is several times their RMSE with exact probabilities (1.4%), and it doesn't shrink with more data.
+- **DR barely moved for near targets** (at most 0.3 points, in every row), as its "either the model or the weights can be right" property suggests. Direct uses no logged probabilities.
+- **Far targets amplify a temperature error, for DR too.** For "much greedier", temperature 1.2 shifted SNPDIS by +5.5% ± 0.4, DR by +25.0% ± 17.8 and IPS by +68.1% ± 15.2. SNPDIS moved least among the estimators that use weights.
+- **A wrong history weight hardly mattered** (at most 1.3 points), because the history term is small next to quality here. When fitted, the history weight was also the least precise (1.006 ± 0.139 across datasets, against 1.000 ± 0.010 for quality).
+- **Fitting with the right features cost nothing measurable** (every shift within 0.3 points of 0). Leaving out history and sponsorship cost up to +9.1% ± 0.2 for IPS on "more personalized", and +0.3% for DR.
+- **A free check flags most of these errors.** With exact probabilities each step's ratio averages to 1, so the per-session sum of (ratio - 1) should be near 0. Testing that at the 5% level flagged 95% to 100% of datasets for every temperature error and for the quality only fit, using the ratios of "same as logging", "slightly different" or "more personalized", and at most 5% with exact or correctly fitted probabilities. It flagged a 20% history weight error in only 23% to 27% of datasets, which fits how little that error moved the estimates.
+
+**Limits:** one catalog, the default world and logging policy, 5,000 sessions, rewards only, and only errors in the policy's own form (a wrong temperature or weight, or a fitted softmax). DR here reuses each target's fitted model across the nine versions, so its numbers differ slightly from `estimate_all`'s DR, which refits. Interval coverage under wrong probabilities waits for #14. Reproduce with:
+
+```bash
+python -m recarena.propensity_error --sizes 5000 --repeats 100 --truth 300000
+```
+
 ## How it's tested
 
 The tests compare the simulator with values worked out by hand from every possible slate, check the estimators against hand-calculated answers, and confirm that doubly robust stays unbiased even with a deliberately wrong model.
