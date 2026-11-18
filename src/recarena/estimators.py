@@ -7,6 +7,10 @@ To add your own estimator, write a function from ``EstimationTask`` to ``Estimat
 either pass it to ``estimate_all(..., estimators={"Mine": fn})`` or register it with
 ``register_estimator("Mine", fn)``.
 
+Every estimator, ``true_value`` and fitted Q evaluation take a discount factor ``gamma``
+(default 1, no discounting). The value at step ``t`` (starting from 0) then counts
+``gamma ** t`` times.
+
 Two slate-aware estimators, ``CascadePDIS`` and ``SNCascadePDIS``, are available by name
 but are not run by default, so existing results don't change.
 """
@@ -19,7 +23,7 @@ from functools import cached_property
 
 import numpy as np
 
-from .data import LoggedData
+from .data import LoggedData, check_gamma, discounts
 from .policies import SoftmaxPolicy
 
 
@@ -47,24 +51,37 @@ def prefix_ratios(data: LoggedData, target: SoftmaxPolicy) -> np.ndarray:
     return np.where(data.active[:, :, None], np.exp(target_log_prob - data.behavior_prefix_log_prob), 1.0)
 
 
-def ips(data: LoggedData, values: np.ndarray, ratios: np.ndarray) -> float:
+def discounted(values: np.ndarray, gamma: float = 1.0) -> np.ndarray:
+    """Per-step values times ``gamma ** t``. With ``gamma = 1`` it returns ``values`` itself."""
+    gamma = check_gamma(gamma)
+    if gamma == 1.0:
+        return values
+    shape = (1, values.shape[1]) + (1,) * (values.ndim - 2)
+    return values * discounts(values.shape[1], gamma).reshape(shape)
+
+
+def ips(data: LoggedData, values: np.ndarray, ratios: np.ndarray, gamma: float = 1.0) -> float:
     """Reweight whole sessions. Unbiased, with very high variance."""
+    values = discounted(values, gamma)
     return float(np.mean(ratios.prod(axis=1) * values.sum(axis=1)))
 
 
-def snips(data: LoggedData, values: np.ndarray, ratios: np.ndarray) -> float:
+def snips(data: LoggedData, values: np.ndarray, ratios: np.ndarray, gamma: float = 1.0) -> float:
     """IPS with normalized weights. Slightly biased, and usually much steadier."""
+    values = discounted(values, gamma)
     weights = ratios.prod(axis=1)
     return float(np.sum(weights * values.sum(axis=1)) / np.sum(weights))
 
 
-def pdis(data: LoggedData, values: np.ndarray, ratios: np.ndarray) -> float:
+def pdis(data: LoggedData, values: np.ndarray, ratios: np.ndarray, gamma: float = 1.0) -> float:
     """Per-decision IS: each step only pays for the decisions made before it."""
+    values = discounted(values, gamma)
     return float(np.mean(np.sum(np.cumprod(ratios, axis=1) * values, axis=1)))
 
 
-def snpdis(data: LoggedData, values: np.ndarray, ratios: np.ndarray) -> float:
+def snpdis(data: LoggedData, values: np.ndarray, ratios: np.ndarray, gamma: float = 1.0) -> float:
     """Per-decision IS with normalized weights at each step."""
+    values = discounted(values, gamma)
     weights = np.cumprod(ratios, axis=1)
     return float(np.sum(np.sum(weights * values, axis=0) / np.sum(weights, axis=0)))
 
@@ -99,12 +116,14 @@ class FittedQ:
         ridge: float = 1.0,
         value_samples: int = 16,
         informed: bool = True,
+        gamma: float = 1.0,
     ):
         self.target = target
         self.examine_decay = examine_decay
         self.ridge = ridge
         self.value_samples = value_samples
         self.informed = informed
+        self.gamma = check_gamma(gamma)
 
     def fit(self, data: LoggedData, values: np.ndarray, rng: np.random.Generator) -> "FittedQ":
         h = data.horizon
@@ -120,7 +139,7 @@ class FittedQ:
                 future = np.zeros(int(here.sum()))
                 if still_here.any():
                     future[still_here] = self.state_value(t + 1, data.obs[here, t + 1][still_here], rng)
-                target_values += future
+                target_values += self.gamma * future
             x = _features(data.obs[here, t], data.slates[here, t], self.target, self.examine_decay, self.informed)
             gram = x.T @ x + self.ridge * np.eye(x.shape[1])
             self.weights[t] = np.linalg.solve(gram, x.T @ target_values)
@@ -139,9 +158,13 @@ class FittedQ:
 
 
 def dr_with_model(
-    data: LoggedData, values: np.ndarray, ratios: np.ndarray, model, rng: np.random.Generator
+    data: LoggedData, values: np.ndarray, ratios: np.ndarray, model, rng: np.random.Generator, gamma: float = 1.0
 ) -> np.ndarray:
-    """Doubly robust score for each session (Jiang and Li, 2016)."""
+    """Doubly robust score for each session (Jiang and Li, 2016).
+
+    ``model`` must estimate discounted values with the same ``gamma``.
+    """
+    gamma = check_gamma(gamma)
     n, h = data.n, data.horizon
     score = np.zeros(n)
     for t in range(h - 1, -1, -1):
@@ -150,7 +173,7 @@ def dr_with_model(
             continue
         q = model.action_value(t, data.obs[here, t], data.slates[here, t])
         v = model.state_value(t, data.obs[here, t], rng)
-        score[here] = v + ratios[here, t] * (values[here, t] + score[here] - q)
+        score[here] = v + ratios[here, t] * (values[here, t] + gamma * score[here] - q)
     return score
 
 
@@ -162,6 +185,7 @@ def direct_and_dr_scores(
     examine_decay: float,
     rng: np.random.Generator,
     informed: bool = True,
+    gamma: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Per-session direct method and doubly robust scores, each from a model fitted on the other fold."""
     order = rng.permutation(data.n)
@@ -169,10 +193,10 @@ def direct_and_dr_scores(
     direct_scores = np.zeros(data.n)
     dr_scores = np.zeros(data.n)
     for held_out, fit_on in ((folds[0], folds[1]), (folds[1], folds[0])):
-        model = FittedQ(target, examine_decay, informed=informed).fit(data.subset(fit_on), values[fit_on], rng)
+        model = FittedQ(target, examine_decay, informed=informed, gamma=gamma).fit(data.subset(fit_on), values[fit_on], rng)
         part = data.subset(held_out)
         direct_scores[held_out] = model.state_value(0, part.obs[:, 0], rng)
-        dr_scores[held_out] = dr_with_model(part, values[held_out], ratios[held_out], model, rng)
+        dr_scores[held_out] = dr_with_model(part, values[held_out], ratios[held_out], model, rng, gamma)
     return direct_scores, dr_scores
 
 
@@ -184,9 +208,12 @@ def direct_and_dr(
     examine_decay: float,
     rng: np.random.Generator,
     informed: bool = True,
+    gamma: float = 1.0,
 ) -> tuple[float, float]:
     """Direct method and doubly robust, each model scored on data it was not fitted on."""
-    direct_scores, dr_scores = direct_and_dr_scores(data, values, ratios, target, examine_decay, rng, informed)
+    direct_scores, dr_scores = direct_and_dr_scores(
+        data, values, ratios, target, examine_decay, rng, informed, gamma
+    )
     return float(direct_scores.mean()), float(dr_scores.mean())
 
 
@@ -229,6 +256,9 @@ class EstimationTask:
     ``values`` is ``data.rewards`` to estimate reward, or ``data.costs`` to estimate cost.
     Shared work (importance ratios, the fitted models for Direct and DR) is computed once
     and reused by every estimator that asks for it.
+
+    ``values`` are undiscounted. With ``gamma < 1``, estimators should use
+    ``discounted_values`` (and ``discounted_slot_values``), as the built-in ones do.
     """
 
     data: LoggedData
@@ -241,7 +271,21 @@ class EstimationTask:
     # slate-aware estimators use them. If left out, they are taken from the logs when
     # ``values`` is ``data.rewards`` or ``data.costs``.
     slot_values: np.ndarray | None = None
+    gamma: float = 1.0
     _model_scores: tuple[np.ndarray, np.ndarray] | None = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.gamma = check_gamma(self.gamma)
+
+    @cached_property
+    def discounted_values(self) -> np.ndarray:
+        """``values`` with step ``t`` times ``gamma ** t``. The same array when ``gamma`` is 1."""
+        return discounted(self.values, self.gamma)
+
+    @cached_property
+    def discounted_slot_values(self) -> np.ndarray:
+        """``per_slot_values`` with step ``t`` times ``gamma ** t``."""
+        return discounted(self.per_slot_values, self.gamma)
 
     @cached_property
     def ratios(self) -> np.ndarray:
@@ -274,7 +318,14 @@ class EstimationTask:
         """Per-session (Direct, DR) scores. Fitted once, on first use."""
         if self._model_scores is None:
             self._model_scores = direct_and_dr_scores(
-                self.data, self.values, self.ratios, self.target, self.examine_decay, self.rng, self.informed
+                self.data,
+                self.values,
+                self.ratios,
+                self.target,
+                self.examine_decay,
+                self.rng,
+                self.informed,
+                self.gamma,
             )
         return self._model_scores
 
@@ -288,26 +339,27 @@ def _mean_estimate(scores: np.ndarray) -> Estimate:
 
 
 def _ips(task: EstimationTask) -> Estimate:
-    return _mean_estimate(task.ratios.prod(axis=1) * task.values.sum(axis=1))
+    return _mean_estimate(task.ratios.prod(axis=1) * task.discounted_values.sum(axis=1))
 
 
 def _snips(task: EstimationTask) -> Estimate:
     weights = task.ratios.prod(axis=1)
-    returns = task.values.sum(axis=1)
+    returns = task.discounted_values.sum(axis=1)
     value = float(np.sum(weights * returns) / np.sum(weights))
     # Delta method for a ratio of means.
     return Estimate(value, weights * (returns - value) / weights.mean())
 
 
 def _pdis(task: EstimationTask) -> Estimate:
-    return _mean_estimate(np.sum(np.cumprod(task.ratios, axis=1) * task.values, axis=1))
+    return _mean_estimate(np.sum(np.cumprod(task.ratios, axis=1) * task.discounted_values, axis=1))
 
 
 def _snpdis(task: EstimationTask) -> Estimate:
     weights = np.cumprod(task.ratios, axis=1)
-    step_values = np.sum(weights * task.values, axis=0) / np.sum(weights, axis=0)
+    values = task.discounted_values
+    step_values = np.sum(weights * values, axis=0) / np.sum(weights, axis=0)
     # Delta method, step by step: each step is a ratio of means.
-    influence = np.sum(weights * (task.values - step_values) / weights.mean(axis=0), axis=1)
+    influence = np.sum(weights * (values - step_values) / weights.mean(axis=0), axis=1)
     return Estimate(float(step_values.sum()), influence)
 
 
@@ -339,13 +391,13 @@ def _cascade_pdis(task: EstimationTask) -> Estimate:
     and stop at their first click. What happens in later steps can depend on the whole
     slate, so earlier steps still pay for full slates.
     """
-    return _mean_estimate(np.sum(_cascade_weights(task) * task.per_slot_values, axis=(1, 2)))
+    return _mean_estimate(np.sum(_cascade_weights(task) * task.discounted_slot_values, axis=(1, 2)))
 
 
 def _sn_cascade_pdis(task: EstimationTask) -> Estimate:
     """CascadePDIS with normalized weights for each step and slot."""
     weights = _cascade_weights(task)
-    values = task.per_slot_values
+    values = task.discounted_slot_values
     cell_values = np.sum(weights * values, axis=0) / np.sum(weights, axis=0)
     # Delta method: each (step, slot) is a ratio of means.
     influence = np.sum(weights * (values - cell_values) / weights.mean(axis=0), axis=(1, 2))
@@ -420,9 +472,13 @@ def estimate_all_detailed(
     informed: bool = True,
     estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
     slot_values: np.ndarray | None = None,
+    gamma: float = 1.0,
 ) -> dict[str, Estimate]:
-    """Run each estimator on the same task. Defaults to the built-in estimators."""
-    task = EstimationTask(data, values, target, examine_decay, rng, informed, slot_values)
+    """Run each estimator on the same task. Defaults to the built-in estimators.
+
+    ``gamma`` discounts step ``t`` by ``gamma ** t``; 1 (the default) means no discounting.
+    """
+    task = EstimationTask(data, values, target, examine_decay, rng, informed, slot_values, gamma)
     resolved = resolve_estimators(estimators)
     # Fit the models first whenever Direct or DR is requested, so the random number
     # stream is used in the same order as before estimators were pluggable.
@@ -446,7 +502,10 @@ def estimate_all(
     informed: bool = True,
     estimators: Iterable[str] | Mapping[str, Estimator] | None = None,
     slot_values: np.ndarray | None = None,
+    gamma: float = 1.0,
 ) -> dict[str, float]:
     """Point estimates from each estimator. Defaults to the built-in estimators."""
-    detailed = estimate_all_detailed(data, values, target, examine_decay, rng, informed, estimators, slot_values)
+    detailed = estimate_all_detailed(
+        data, values, target, examine_decay, rng, informed, estimators, slot_values, gamma
+    )
     return {name: result.value for name, result in detailed.items()}

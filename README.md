@@ -56,7 +56,7 @@ from recarena import Estimate, estimate_all_detailed, register_estimator
 
 def clipped_ips(task):
     weights = np.minimum(task.ratios.prod(axis=1), 10.0)
-    scores = weights * task.values.sum(axis=1)
+    scores = weights * task.discounted_values.sum(axis=1)
     return Estimate(scores.mean(), scores - scores.mean())  # The second part is optional.
 
 register_estimator("Clipped IPS", clipped_ips)
@@ -65,6 +65,8 @@ print({name: (round(r.value, 3), round(r.standard_error(), 3)) for name, r in re
 ```
 
 The second part of an `Estimate` is each session's influence on the estimate. Confidence intervals are built from it. Every built-in estimator except Direct provides it. Direct's per-session scores barely vary because sessions start from nearly the same state, so its `standard_error()` is NaN rather than misleadingly small (see #22). The benchmark and stress test take `--estimators` to choose which to run. To use your own estimator there, pass the function itself to `run(..., estimators={"Clipped IPS": clipped_ips})` from a module it can be imported from.
+
+To discount, pass `gamma` (between 0 and 1, default 1) to `true_value`, `estimate_all` or `estimate_all_detailed`. The value at step `t`, counting from 0, then counts `gamma ** t` times. Fitted Q evaluation and DR discount the next step's value the same way. `task.discounted_values` is `task.values` with the discount applied, and is the same array when `gamma` is 1, so use it in your own estimators. The benchmark and stress test don't take `gamma` yet, and all published results are undiscounted.
 
 Or train an agent:
 

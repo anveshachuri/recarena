@@ -108,6 +108,19 @@ def relog(data: LoggedData, policy) -> LoggedData:
     )
 
 
+def check_gamma(gamma: float) -> float:
+    """A discount factor must be between 0 and 1. 1 (the default) means no discounting."""
+    gamma = float(gamma)
+    if not 0.0 <= gamma <= 1.0:
+        raise ValueError(f"gamma must be between 0 and 1, got {gamma}")
+    return gamma
+
+
+def discounts(horizon: int, gamma: float) -> np.ndarray:
+    """``gamma ** t`` for each step ``t`` from 0 to ``horizon - 1``."""
+    return check_gamma(gamma) ** np.arange(horizon)
+
+
 @dataclass(frozen=True)
 class TrueValue:
     reward: float
@@ -123,8 +136,14 @@ def true_value(
     n: int,
     rng: np.random.Generator,
     chunk: int = 50_000,
+    gamma: float = 1.0,
 ) -> TrueValue:
-    """The answer every estimator is scored against: run the policy itself many times."""
+    """The answer every estimator is scored against: run the policy itself many times.
+
+    With ``gamma < 1`` the value is the discounted return, which counts what happens at
+    step ``t`` (starting from 0) times ``gamma ** t``.
+    """
+    gamma = check_gamma(gamma)
     reward_returns, cost_returns = [], []
     remaining = n
     while remaining > 0:
@@ -132,8 +151,10 @@ def true_value(
         sim = BatchSimulator(config, catalog, size, rng)
         obs = sim.reset()
         reward_sum, cost_sum = np.zeros(size), np.zeros(size)
-        for _ in range(config.horizon):
+        for t in range(config.horizon):
             rewards, costs, _ = sim.step(policy.sample(obs, config.slate_size, rng))
+            if gamma != 1.0:
+                rewards, costs = gamma**t * rewards, gamma**t * costs
             reward_sum += rewards
             cost_sum += costs
             obs = sim.observe()

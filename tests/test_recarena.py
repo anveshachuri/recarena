@@ -1046,3 +1046,162 @@ def test_propensity_error_experiment_runs_and_reports_every_kind_of_error():
     for e in ERRORS:
         assert f"| {e.name} |" in report
     assert "## Warning sign: share of datasets flagged (100 sessions)" in report
+
+
+# Discount factor (issue #5).
+
+
+def test_discounted_estimators_match_hand_calculations():
+    from recarena.estimators import _cascade_pdis, _ips, _pdis, _sn_cascade_pdis, _snips, _snpdis
+
+    data, ratios = handmade_data()
+    r = data.rewards
+    # gamma = 0.5 turns session one's rewards (1, 2, 3) into (1, 1, 0.75). Session two only has step one.
+    assert ips(data, r, ratios, gamma=0.5) == pytest.approx((3.0 * 2.75 + 0.5 * 4.0) / 2)
+    assert snips(data, r, ratios, gamma=0.5) == pytest.approx((3.0 * 2.75 + 0.5 * 4.0) / 3.5)
+    assert pdis(data, r, ratios, gamma=0.5) == pytest.approx(((2 * 1 + 1 * 1 + 3 * 0.75) + 0.5 * 4) / 2)
+    steps = [(2 * 1 + 0.5 * 4) / 2.5, (1 * 1) / 1.5, (3 * 0.75) / 3.5]
+    assert snpdis(data, r, ratios, gamma=0.5) == pytest.approx(sum(steps))
+
+    task = task_with_ratios(data, ratios)
+    task.gamma = 0.5
+    assert _ips(task).value == pytest.approx(ips(data, r, ratios, gamma=0.5))
+    assert _snips(task).value == pytest.approx(snips(data, r, ratios, gamma=0.5))
+    assert _pdis(task).value == pytest.approx(pdis(data, r, ratios, gamma=0.5))
+    assert _pdis(task).influence == pytest.approx([5.25 - 3.625, 2.0 - 3.625])
+    snpdis_result = _snpdis(task)
+    weights = np.array([[2.0, 1.0, 3.0], [0.5, 0.5, 0.5]])
+    discounted_rewards = r * np.array([1.0, 0.5, 0.25])
+    expected = [
+        sum(weights[i, t] * (discounted_rewards[i, t] - steps[t]) / weights[:, t].mean() for t in range(3))
+        for i in range(2)
+    ]
+    assert snpdis_result.value == pytest.approx(sum(steps))
+    assert snpdis_result.influence == pytest.approx(expected)
+
+    slot_task, slot_values = handmade_slot_task()
+    slot_task.gamma = 0.5
+    # Session one: 1 * 4 * 1 + 0.5 * (2 * 0.5 * 2) + 0.25 * ((2 * 0.5) * 1.5 * 3). Session two: 0.5 * 4.
+    assert _cascade_pdis(slot_task).value == pytest.approx((4.0 + 1.0 + 1.125 + 2.0) / 2)
+    cell_weights = np.array(
+        [
+            [[4.0, 2.0], [2.0, 1.0], [1.5, 3.0]],
+            [[0.25, 0.5], [0.5, 0.5], [0.5, 0.5]],
+        ]
+    )
+    cells = (cell_weights * slot_values).sum(axis=0) / cell_weights.sum(axis=0)
+    assert _sn_cascade_pdis(slot_task).value == pytest.approx(np.sum(cells * np.array([1.0, 0.5, 0.25])[:, None]))
+
+
+def test_discounted_doubly_robust_matches_hand_calculation():
+    data, ratios = handmade_data()
+
+    class Constant:
+        def action_value(self, t, obs, slates):
+            return np.full(len(obs), 1.0)
+
+        def state_value(self, t, obs, rng):
+            return np.full(len(obs), 2.0)
+
+    scores = dr_with_model(data, data.rewards, ratios, Constant(), np.random.default_rng(0), gamma=0.5)
+    # dr = v + ratio * (reward + gamma * next - q), worked backward.
+    step3 = 2 + 3 * (3 + 0 - 1)
+    step2 = 2 + 0.5 * (2 + 0.5 * step3 - 1)
+    step1 = 2 + 2 * (1 + 0.5 * step2 - 1)
+    assert scores[0] == pytest.approx(step1)
+    assert scores[1] == pytest.approx(2 + 0.5 * (4 + 0 - 1))
+
+
+def test_fitted_q_discounts_the_next_step_value():
+    from recarena.estimators import _features
+
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=2.0)
+    data = collect(SHORT, catalog, behavior, 2000, np.random.default_rng(50))
+    model = FittedQ(target, SHORT.examine_decay, gamma=0.5).fit(data, data.rewards, np.random.default_rng(51))
+
+    # Redo step 1's regression by hand, with the fitted step 2 model and the same random draws.
+    rng = np.random.default_rng(51)
+    here = data.active[:, 1]
+    still_here = data.active[here, 2]
+    future = np.zeros(int(here.sum()))
+    future[still_here] = model.state_value(2, data.obs[here, 2][still_here], rng)
+    x = _features(data.obs[here, 1], data.slates[here, 1], target, SHORT.examine_decay)
+    y = data.rewards[here, 1] + 0.5 * future
+    expected = np.linalg.solve(x.T @ x + np.eye(x.shape[1]), x.T @ y)
+    assert model.weights[1] == pytest.approx(expected)
+
+    # gamma = 0 fits the first step's reward alone, as if nothing came after it.
+    first_only = np.zeros_like(data.rewards)
+    first_only[:, 0] = data.rewards[:, 0]
+    zero = FittedQ(target, SHORT.examine_decay, gamma=0.0).fit(data, data.rewards, np.random.default_rng(52))
+    plain = FittedQ(target, SHORT.examine_decay).fit(data, first_only, np.random.default_rng(52))
+    assert zero.weights[0] == pytest.approx(plain.weights[0])
+
+
+def test_true_value_with_gamma_zero_is_the_first_step_value():
+    config = SimConfig(n_items=4, n_topics=2, slate_size=2, horizon=3, catalog_seed=3, fixed_interest=(0.7, 0.3))
+    catalog = Catalog.generate(config)
+    policy = SoftmaxPolicy(catalog)
+    truth = true_value(config, catalog, policy, 400_000, np.random.default_rng(53), gamma=0.0)
+    assert within(truth.reward, exact_one_step_value(config, catalog, policy), truth.reward_stderr)
+    full = true_value(config, catalog, policy, 100_000, np.random.default_rng(53))
+    assert full.reward > truth.reward + 10 * full.reward_stderr
+
+
+def test_discounted_estimators_recover_discounted_truth():
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5, sponsored_weight=1.0)
+    gamma = 0.7
+    truth = true_value(SHORT, catalog, target, 400_000, np.random.default_rng(54), gamma=gamma)
+    undiscounted = true_value(SHORT, catalog, target, 400_000, np.random.default_rng(54))
+    assert undiscounted.reward - truth.reward > 10 * undiscounted.reward_stderr
+    data = collect(SHORT, catalog, behavior, 400_000, np.random.default_rng(55))
+    cases = ((data.rewards, truth.reward, truth.reward_stderr), (data.costs, truth.cost, truth.cost_stderr))
+    for values, true, true_stderr in cases:
+        results = estimate_all_detailed(
+            data,
+            values,
+            target,
+            SHORT.examine_decay,
+            np.random.default_rng(0),
+            estimators=["IPS", "PDIS", "CascadePDIS"],
+            gamma=gamma,
+        )
+        for name, result in results.items():
+            assert within(result.value, true, np.hypot(result.standard_error(), true_stderr)), name
+
+
+def test_discounted_doubly_robust_is_unbiased_with_a_wrong_model():
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5)
+    truth = true_value(SHORT, catalog, target, 400_000, np.random.default_rng(56), gamma=0.7)
+    rng = np.random.default_rng(57)
+    data = collect(SHORT, catalog, behavior, 60_000, rng)
+    model = WrongModel()
+    model.policy, model.size = target, SHORT.slate_size
+    scores = dr_with_model(data, data.rewards, importance_ratios(data, target), model, rng, gamma=0.7)
+    stderr = np.hypot(scores.std() / np.sqrt(data.n), truth.reward_stderr)
+    assert within(scores.mean(), truth.reward, stderr)
+    fitted = estimate_all_detailed(
+        data, data.rewards, target, SHORT.examine_decay, np.random.default_rng(58), estimators=["DR"], gamma=0.7
+    )["DR"]
+    assert within(fitted.value, truth.reward, np.hypot(fitted.standard_error(), truth.reward_stderr))
+
+
+@pytest.mark.parametrize("gamma", [-0.1, 1.5])
+def test_gamma_outside_zero_to_one_is_rejected(gamma):
+    catalog = Catalog.generate(SHORT)
+    policy = SoftmaxPolicy(catalog)
+    data, ratios = handmade_data()
+    with pytest.raises(ValueError):
+        true_value(SHORT, catalog, policy, 10, np.random.default_rng(0), gamma=gamma)
+    with pytest.raises(ValueError):
+        ips(data, data.rewards, ratios, gamma=gamma)
+    with pytest.raises(ValueError):
+        FittedQ(policy, SHORT.examine_decay, gamma=gamma)
+    with pytest.raises(ValueError):
+        EstimationTask(data, data.rewards, policy, 1.0, np.random.default_rng(0), gamma=gamma)
