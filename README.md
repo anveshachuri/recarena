@@ -193,6 +193,22 @@ Every weighting estimator divides by the logging policy's probabilities, and `co
 python -m recarena.propensity_error --sizes 5000 --repeats 100 --truth 300000
 ```
 
+## Can budget decisions be made safe?
+
+The stress test scores right and wrong budget decisions together, but the two mistakes cost different things: approving a policy for a budget it breaks can be much worse than rejecting one that fits. `python -m recarena.budget` counts them separately for budgets 10% below and above each policy's true cost, and also decides with a one-sided upper bound on cost, the estimate plus z standard errors from each estimator's per-session influence values (a normal interval), at levels from 80% to 99%. Direct reports no standard error (#22), so it only has the point estimate. Full tables are in [`results/budget.md`](results/budget.md). What it found, with 5,000 sessions and 100 logged datasets per scenario over 5 catalogs (far targets pooled, 200 decisions per budget):
+
+- **Almost every mistake on far targets is a false approval.** With the point estimate, SNPDIS falsely approved the tight budget in 51% to 76% of decisions depending on the scenario, and falsely rejected the loose one in only 4% to 9%. The weighted estimators' estimate was below the true cost in 76% to 93% of datasets, which fits the low session weights in #24.
+- **A normal upper bound helps less than its level promises.** Even at 99%, the true cost was above SNPDIS's bound in 42% to 60% of datasets (it should be about 1%), and false approvals were still 12% to 30%, while false rejections rose to 22% to 38%. IPS and SNIPS were worse: 37% to 66% false approvals at 99%.
+- **DR's bound worked when its model was informed.** At 95%, the true cost was above it in 4% to 6% of datasets in the three informed scenarios, with no false approvals, but 52% to 62% false rejections. With the uninformed model it was above in 26% to 30%.
+- **Direct with the informed model made no mistakes at all**, but with the uninformed model it falsely approved 50% to 70% of tight budgets, and there is no interval to warn about that.
+- **Near targets were easy for everyone** (at most 1% of either mistake).
+
+**Limits:** 5,000 sessions only, one budget margin (10%), normal intervals only (other interval methods are #14), and decisions from the same catalog are correlated, so the rough 3.5 point Monte Carlo standard error per rate is optimistic. The bonus in #16, picking a policy under a budget from logs alone, isn't done. Reproduce with:
+
+```bash
+python -m recarena.budget --catalogs 5 --sizes 5000 --repeats 20 --truth 200000
+```
+
 ## How it's tested
 
 The tests compare the simulator with values worked out by hand from every possible slate, check the estimators against hand-calculated answers, and confirm that doubly robust stays unbiased even with a deliberately wrong model.

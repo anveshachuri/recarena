@@ -1205,3 +1205,58 @@ def test_gamma_outside_zero_to_one_is_rejected(gamma):
         FittedQ(policy, SHORT.examine_decay, gamma=gamma)
     with pytest.raises(ValueError):
         EstimationTask(data, data.rewards, policy, 1.0, np.random.default_rng(0), gamma=gamma)
+
+
+# ---------------------------------------------------------------------------
+# Safer budget decisions (issue #16)
+# ---------------------------------------------------------------------------
+
+
+def test_budget_errors_separate_the_two_mistakes():
+    from recarena.budget import budget_errors
+
+    assert budget_errors(1.0, 1.0) == (False, False)  # Accurate: fits +10%, misses -10%.
+    assert budget_errors(0.85, 1.0) == (True, False)  # Too low: approves the budget it breaks.
+    assert budget_errors(1.15, 1.0) == (False, True)  # Too high: rejects the budget it fits.
+    assert budget_errors(0.9, 1.0) == (True, False)  # On the tight budget: approved, as in the stress test.
+    assert budget_errors(1.1, 1.0) == (False, False)  # On the loose budget: approved.
+
+
+def test_point_estimate_decisions_match_the_stress_test():
+    from recarena.budget import budget_errors, upper_bound
+    from recarena.stress import budget_decisions_correct
+
+    rng = np.random.default_rng(16)
+    for estimate, true_cost in zip(rng.uniform(0.5, 1.5, 500), rng.uniform(0.5, 1.5, 500)):
+        fa, fr = budget_errors(upper_bound(estimate, float("nan"), 0.5), true_cost)
+        assert 2 - fa - fr == budget_decisions_correct(estimate, true_cost)
+
+
+def test_upper_bound_uses_the_normal_quantile_and_trades_one_mistake_for_the_other():
+    from recarena.budget import LEVELS, budget_errors, upper_bound
+
+    assert upper_bound(1.0, 0.1, 0.95) == pytest.approx(1.0 + 1.6448536 * 0.1)
+    assert upper_bound(1.0, 0.1, 0.5) == 1.0
+    assert np.isnan(upper_bound(1.0, float("nan"), 0.9))
+    with pytest.raises(ValueError):
+        upper_bound(1.0, 0.1, 0.4)
+    rng = np.random.default_rng(17)
+    for estimate, se, true_cost in zip(rng.uniform(0.5, 1.5, 200), rng.uniform(0, 0.3, 200), rng.uniform(0.5, 1.5, 200)):
+        decisions = [budget_errors(upper_bound(estimate, se, lv), true_cost) for lv in LEVELS]
+        approvals = [fa for fa, _ in decisions]
+        rejections = [fr for _, fr in decisions]
+        assert approvals == sorted(approvals, reverse=True)  # Higher levels approve less...
+        assert rejections == sorted(rejections)  # ...and reject more.
+
+
+def test_budget_experiment_runs_and_reports_every_scenario():
+    from recarena.budget import run
+    from recarena.stress import SCENARIOS
+
+    report = run(catalogs=1, sizes=[100], repeats=2, truth_runs=500, seed=0, workers=1, estimators=["SNPDIS", "Direct"])
+    assert "## Far targets: false approvals / false rejections (100 sessions)" in report
+    for s in SCENARIOS:
+        assert f"| {s.name} | SNPDIS |" in report
+        assert f"| {s.name} | Direct |" in report
+    direct_rows = [line for line in report.splitlines() if "| Direct |" in line]
+    assert all(line.count("n/a") == 4 for line in direct_rows)  # Only the point row has numbers.
