@@ -217,6 +217,45 @@ def direct_and_dr(
     return float(direct_scores.mean()), float(dr_scores.mean())
 
 
+@dataclass(frozen=True)
+class WeightDiagnostics:
+    """Checks on the importance weights that cost nothing and have a known answer (issue #24).
+
+    ``step_mean_weights[t]`` is the mean over sessions of the product of the ratios up to and
+    including step ``t``, and ``mean_session_weight`` is the mean of the whole-session weight
+    that IPS uses (the last step's value, since ratios are 1 after a session ends). Under the
+    logging policy each has expectation exactly 1. Far below 1 means the dataset is missing
+    weight mass that sits in rare sessions it never saw, and the unbiased estimators are then
+    probably low.
+
+    The self-normalized estimators divide by exactly these numbers: SNIPS is IPS divided by
+    ``mean_session_weight``, and SNPDIS divides PDIS's term for step ``t`` by
+    ``step_mean_weights[t]``.
+
+    ``session_weight_stderr`` is the plain standard error of ``mean_session_weight``. With
+    heavy tailed weights it is itself usually too small, for the same reason.
+    """
+
+    mean_session_weight: float
+    session_weight_stderr: float
+    step_mean_weights: np.ndarray
+
+    @property
+    def lowest_step_mean_weight(self) -> float:
+        return float(self.step_mean_weights.min())
+
+
+def weight_diagnostics(ratios: np.ndarray) -> WeightDiagnostics:
+    """Weight diagnostics from per-step ratios of shape (n, horizon), as ``importance_ratios`` returns."""
+    ratios = np.asarray(ratios, dtype=float)
+    if ratios.ndim != 2 or len(ratios) == 0:
+        raise ValueError("ratios must have shape (n, horizon) with at least one session")
+    cumulative = np.cumprod(ratios, axis=1)
+    session = cumulative[:, -1]
+    stderr = float(np.std(session, ddof=1) / np.sqrt(len(session))) if len(session) > 1 else float("nan")
+    return WeightDiagnostics(float(session.mean()), stderr, cumulative.mean(axis=0))
+
+
 # ---------------------------------------------------------------------------
 # Pluggable estimators
 #

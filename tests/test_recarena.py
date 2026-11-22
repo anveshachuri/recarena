@@ -1260,3 +1260,66 @@ def test_budget_experiment_runs_and_reports_every_scenario():
         assert f"| {s.name} | Direct |" in report
     direct_rows = [line for line in report.splitlines() if "| Direct |" in line]
     assert all(line.count("n/a") == 4 for line in direct_rows)  # Only the point row has numbers.
+
+
+# ---------------------------------------------------------------------------
+# Session weight diagnostics (issue #24)
+# ---------------------------------------------------------------------------
+
+
+def test_weight_diagnostics_match_hand_calculation():
+    from recarena import weight_diagnostics
+
+    _, ratios = handmade_data()
+    d = weight_diagnostics(ratios)
+    # Session weights 2 * 0.5 * 3 = 3 and 0.5 (ratios are 1 after the second session ends).
+    assert d.mean_session_weight == pytest.approx(1.75)
+    assert d.session_weight_stderr == pytest.approx(np.std([3.0, 0.5], ddof=1) / np.sqrt(2))
+    # Cumulative weights (2, 1, 3) and (0.5, 0.5, 0.5).
+    assert d.step_mean_weights == pytest.approx([1.25, 0.75, 1.75])
+    assert d.lowest_step_mean_weight == pytest.approx(0.75)
+    with pytest.raises(ValueError):
+        weight_diagnostics(np.ones(3))
+
+
+def test_self_normalized_estimators_divide_by_the_weight_diagnostics():
+    from recarena import weight_diagnostics
+
+    catalog = Catalog.generate(SHORT)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 2000, np.random.default_rng(24))
+    ratios = importance_ratios(data, SoftmaxPolicy(catalog, quality_weight=0.25))
+    d = weight_diagnostics(ratios)
+    r = data.rewards
+    assert snips(data, r, ratios) == pytest.approx(ips(data, r, ratios) / d.mean_session_weight)
+    per_step_pdis = np.mean(np.cumprod(ratios, axis=1) * r, axis=0)
+    assert snpdis(data, r, ratios) == pytest.approx(np.sum(per_step_pdis / d.step_mean_weights))
+
+
+def test_weight_diagnostics_average_to_one_under_the_logging_policy():
+    from recarena import weight_diagnostics
+
+    catalog = Catalog.generate(SHORT)
+    data = collect(SHORT, catalog, SoftmaxPolicy(catalog), 200_000, np.random.default_rng(25))
+    for target in (SoftmaxPolicy(catalog, quality_weight=1.5, history_weight=1.5), SoftmaxPolicy(catalog, sponsored_weight=1.0)):
+        ratios = importance_ratios(data, target)
+        d = weight_diagnostics(ratios)
+        assert within(d.mean_session_weight, 1.0, d.session_weight_stderr)
+        cumulative = np.cumprod(ratios, axis=1)
+        step_se = cumulative.std(axis=0, ddof=1) / np.sqrt(data.n)
+        for mean, se in zip(d.step_mean_weights, step_se):
+            assert within(mean, 1.0, se)
+    # The logging policy itself has every weight exactly 1.
+    d = weight_diagnostics(importance_ratios(data, SoftmaxPolicy(catalog)))
+    assert d.mean_session_weight == pytest.approx(1.0)
+    assert d.step_mean_weights == pytest.approx(np.ones(SHORT.horizon))
+
+
+def test_weight_mass_experiment_runs_and_reports_every_world():
+    from recarena.weight_mass import run, world_name, worlds
+
+    report = run(catalogs=1, size=100, repeats=2, truth_runs=500, seed=0, workers=1)
+    assert len(worlds()) == 4
+    for w in worlds():
+        assert f"| {world_name(w)} | much greedier |" in report
+    assert "### SNPDIS, cost" in report
+    assert "| mean session weight below 0.5 |" in report

@@ -209,6 +209,21 @@ The stress test scores right and wrong budget decisions together, but the two mi
 python -m recarena.budget --catalogs 5 --sizes 5000 --repeats 20 --truth 200000
 ```
 
+## Why are the unbiased estimators low on far targets?
+
+The session weight, the product of the slate probability ratios over a session, has expectation exactly 1 under the logging policy, so its mean in a dataset is a free check with a known answer. `weight_diagnostics(importance_ratios(data, target))` reports it, along with the mean cumulative weight at each step (also 1 in expectation). SNIPS divides IPS by the mean session weight, and SNPDIS divides each step of PDIS by that step's mean weight. `python -m recarena.weight_mass` computes it in the four stress test worlds for every target and compares it with the weighted estimators' errors. Full tables are in [`results/weight_mass.md`](results/weight_mass.md). What it found, with 5,000 sessions and 200 logged datasets per world over 5 catalogs:
+
+- **On far targets a typical dataset is missing 14% to 41% of the weight mass** (going by the medians). The median mean session weight was 0.59 to 0.86 for "pushes sponsored" and 0.74 to 0.78 for "much greedier", below 1 in 74% to 89% of datasets. Rare datasets with a huge mean (up to 66) keep the expectation at 1. On near targets the median was 0.999 to 1.001 and the 10th percentile at least 0.99.
+- **That is where PDIS's negative average error comes from.** On "pushes sponsored", PDIS's average reward error was -17.8% in datasets with a mean weight below 0.5, -9.6% between 0.5 and 0.9, and +2.6% and +1.0% at 0.9 or more. So the negative average error on far targets reflects heavy tailed weights, not a bug.
+- **As a warning sign it mostly says "this target is far".** It never fired below 0.9 on a near target. Within the far targets, where most estimates already have a large error (over 10% of the true value), a mean weight below 0.5 raised PDIS's share of large reward errors only from 69% to 85%, and caught 8% of them. It did more for costs and for IPS and SNIPS.
+- **It says nothing about SNPDIS's reward error**, which stayed 5% to 9% low even in datasets with a mean weight of 1.1 or more. Normalizing removes the weight mass effect but leaves another bias.
+
+**Limits:** 5,000 sessions only, the default logging policy only, one threshold for a large error, and datasets from the same catalog share a true value, so they are not independent. Reproduce with:
+
+```bash
+python -m recarena.weight_mass --catalogs 5 --size 5000 --repeats 40 --truth 200000
+```
+
 ## How it's tested
 
 The tests compare the simulator with values worked out by hand from every possible slate, check the estimators against hand-calculated answers, and confirm that doubly robust stays unbiased even with a deliberately wrong model.

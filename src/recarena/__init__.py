@@ -6,10 +6,12 @@ from .estimators import (
     ESTIMATOR_NAMES,
     Estimate,
     EstimationTask,
+    WeightDiagnostics,
     available_estimators,
     estimate_all,
     estimate_all_detailed,
     register_estimator,
+    weight_diagnostics,
 )
 from .policies import SoftmaxPolicy, UniformMixturePolicy
 from .simulator import BatchSimulator, Catalog, SimConfig
@@ -26,6 +28,7 @@ __all__ = [
     "SoftmaxPolicy",
     "TrueValue",
     "UniformMixturePolicy",
+    "WeightDiagnostics",
     "available_estimators",
     "collect",
     "estimate_all",
@@ -33,4 +36,5 @@ __all__ = [
     "register_estimator",
     "relog",
     "true_value",
+    "weight_diagnostics",
 ]
