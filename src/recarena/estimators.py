@@ -11,8 +11,8 @@ Every estimator, ``true_value`` and fitted Q evaluation take a discount factor `
 (default 1, no discounting). The value at step ``t`` (starting from 0) then counts
 ``gamma ** t`` times.
 
-Two slate-aware estimators, ``CascadePDIS`` and ``SNCascadePDIS``, are available by name
-but are not run by default, so existing results don't change.
+Three slate-aware estimators, ``CascadePDIS``, ``SNCascadePDIS`` and ``IndependentIPS``,
+are available by name but are not run by default, so existing results don't change.
 """
 
 from __future__ import annotations
@@ -49,6 +49,31 @@ def prefix_ratios(data: LoggedData, target: SoftmaxPolicy) -> np.ndarray:
     flat_slates = data.slates.reshape(n * h, k)
     target_log_prob = target.prefix_log_prob(flat_obs, flat_slates).reshape(n, h, k)
     return np.where(data.active[:, :, None], np.exp(target_log_prob - data.behavior_prefix_log_prob), 1.0)
+
+
+def slot_ratios(data: LoggedData, target, where: np.ndarray | None = None) -> np.ndarray:
+    """Ratio of target to behavior chance that each slot's logged item lands in that slot.
+
+    Shape (n, horizon, slate_size). Marginal over the rest of the slate, as independent IPS
+    uses it. ``where`` picks the entries to compute (default: every slot of every active
+    step). The rest, and every slot after a session ends, are 1.
+    """
+    if data.behavior_slot_log_prob is None:
+        raise ValueError("these logs have no behavior_slot_log_prob; add it with with_slot_log_prob()")
+    n, h, k = data.slates.shape
+    if where is None:
+        where = np.broadcast_to(data.active[:, :, None], (n, h, k))
+    where = np.asarray(where, dtype=bool) & data.active[:, :, None]
+    behavior = data.behavior_slot_log_prob
+    if np.any(np.isnan(behavior[where])):
+        raise ValueError(
+            "behavior_slot_log_prob is missing for some slots this estimate needs; "
+            "compute it there with with_slot_log_prob(data, policy, where)"
+        )
+    flat = target.slot_log_prob(data.obs.reshape(n * h, -1), data.slates.reshape(n * h, k), where.reshape(n * h, k))
+    out = np.ones((n, h, k))
+    out[where] = np.exp(flat.reshape(n, h, k)[where] - behavior[where])
+    return out
 
 
 def discounted(values: np.ndarray, gamma: float = 1.0) -> np.ndarray:
@@ -443,8 +468,30 @@ def _sn_cascade_pdis(task: EstimationTask) -> Estimate:
     return Estimate(float(cell_values.sum()), influence)
 
 
+def _independent_ips(task: EstimationTask) -> Estimate:
+    """Independent (item-position) IPS within a step, full slate ratios across steps.
+
+    Within step ``t`` it weights the value in slot ``j`` by the ratio of the chance that the
+    logged item lands in slot ``j`` under each policy, marginal over the rest of the slate.
+    That is the independent IPS estimator of Li et al. (2018, "Offline evaluation of ranking
+    policies with click models"). It is unbiased only if a slot's value depends on nothing
+    but its own item. In this simulator that holds for costs within a step (a slot adds
+    cost only if its own item is sponsored) and fails for rewards, because users stop at
+    their first click, so a slot's reward depends on the items above it. As with
+    ``CascadePDIS``, earlier steps pay for full slates, since later steps can depend on them.
+
+    The logs need ``behavior_slot_log_prob``, from ``with_slot_log_prob``, for every slot
+    whose value isn't zero. Only those slots are computed.
+    """
+    values = task.discounted_slot_values
+    ratios = slot_ratios(task.data, task.target, values != 0)
+    before = np.cumprod(task.ratios, axis=1)
+    before = np.concatenate([np.ones((task.data.n, 1)), before[:, :-1]], axis=1)
+    return _mean_estimate(np.sum(before[:, :, None] * ratios * values, axis=(1, 2)))
+
+
 ESTIMATOR_NAMES = ("IPS", "SNIPS", "PDIS", "SNPDIS", "Direct", "DR")
-SLATE_AWARE_NAMES = ("CascadePDIS", "SNCascadePDIS")
+SLATE_AWARE_NAMES = ("CascadePDIS", "SNCascadePDIS", "IndependentIPS")
 
 _BUILT_IN: dict[str, Estimator] = {
     "IPS": _ips,
@@ -458,6 +505,7 @@ _BUILT_IN: dict[str, Estimator] = {
 _SLATE_AWARE: dict[str, Estimator] = {
     "CascadePDIS": _cascade_pdis,
     "SNCascadePDIS": _sn_cascade_pdis,
+    "IndependentIPS": _independent_ips,
 }
 _REGISTRY: dict[str, Estimator] = {**_BUILT_IN, **_SLATE_AWARE}
 

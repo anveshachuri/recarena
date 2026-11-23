@@ -14,7 +14,7 @@ recarena is a simulator where the true answer is known. It runs each policy dire
 - **Slates:** users look down a list and stop at their first click, and they are less likely to look at lower slots.
 - **A Gymnasium environment**, `SlateRecEnv`, for training RL agents.
 - **Six estimators:** IPS, SNIPS, PDIS, SNPDIS, a direct method (fitted Q evaluation) and doubly robust.
-- **Two slate-aware estimators**, CascadePDIS and SNCascadePDIS, which you can ask for by name.
+- **Three slate-aware estimators**, CascadePDIS, SNCascadePDIS and IndependentIPS, which you can ask for by name.
 - **Budgets:** each step reports sponsored exposure as a cost, so you can test whether an estimator can tell if a policy stays within a budget.
 
 ## Quickstart
@@ -156,10 +156,32 @@ estimate_all(logs, logs.rewards, new, config.examine_decay, rng, estimators=["SN
 - **Near targets don't change.** All four estimators agree to within 0.2 points.
 - **Far targets in long sessions show a large average error even for the unbiased estimators** (for example between -12.3% and -16.2% for all four estimators on "much greedier" with slates of 5 and 5,000 sessions). A likely reason, not yet checked, is that the weights are so heavy tailed that 200 datasets rarely include the huge weights that make the average come out right.
 
-**Limits:** one catalog, the default world, the default logging policy, rewards only (costs are supported but weren't scored here), and only the cascade estimator. The pseudoinverse estimator and independent or position-based IPS from #13 aren't implemented. Reproduce with:
+**Limits:** one catalog, the default world, the default logging policy, rewards only, and only the cascade estimator. The tables were made before independent IPS and cost scoring were added. Rerunning the command below adds those columns and tables and leaves the existing numbers unchanged. Reproduce with:
 
 ```bash
 python -m recarena.slate_estimators --slate-sizes 2 3 5 --horizons 1 20 --sizes 1000 5000 --repeats 200 --truth 500000
+```
+
+### What does a wrong slate assumption cost? (#27)
+
+`IndependentIPS` (the item-position estimator of Li et al. 2018) weights a value in slot j of a step by the ratio of the chance that the logged item lands in slot j, over everything else in the slate, times the full slate ratios of earlier steps. That assumes a slot's value depends only on its own item. Here it holds for costs within a step, since a slot adds cost only if its own item is sponsored, and fails for rewards, since a slot pays off only if nothing above it was clicked. So costs are the control. The logs need the slot probabilities, which `collect` doesn't compute because they are slow:
+
+```python
+logs = with_slot_log_prob(logs, old, (logs.slot_rewards != 0) | (logs.slot_costs != 0))
+estimate_all(logs, logs.rewards, new, config.examine_decay, rng, estimators=["CascadePDIS", "IndependentIPS"])
+```
+
+The slot probabilities of a Plackett-Luce slate are computed with quadrature and checked against brute force in the tests. Full tables are in [`results/independent_ips.md`](results/independent_ips.md). What it found, with only 50 logged datasets per cell (RMSE as a share of the true value, 5,000 sessions):
+
+- **In one-step sessions it had the smallest error of the five, and no bias we could detect on rewards.** With slates of 5, for "pushes sponsored" and "much greedier", PDIS had 7.4% and 5.8%, CascadePDIS 4.7% and 4.3%, IndependentIPS 3.0% and 2.9%. Its average reward error there was +0.6% ± 0.4 and +0.9% ± 0.4, the same as CascadePDIS (+0.9% ± 0.7 and +0.9% ± 0.6), which is unbiased. With slates of 3 it had 3.1% and 3.5% against 4.8% and 4.3% for CascadePDIS.
+- **The broken assumption does bias rewards, but not by enough to see here.** A test with a target that prefers low quality items and 400,000 sessions finds the bias. With the five usual targets, it is smaller than what 50 datasets can resolve (standard errors of 0.4 to 1.5 points in one-step sessions). So in this simulator, at these sample sizes, the variance it saves is worth more than the bias it costs.
+- **Costs behave as the control should.** With slates of 5 in one-step sessions its average cost error was -0.3% ± 0.2 for both far targets, with RMSE 1.3% and 1.8% against 8.8% and 4.1% for PDIS.
+- **In 20-step sessions the gain is gone.** The full slate ratios of earlier steps dominate the weight, as for CascadePDIS, and without normalizing it can be much worse: 43.8% ± 10.5 for "pushes sponsored" with slates of 5, against 24.5% ± 1.6 for SNCascadePDIS.
+
+**Limits:** 50 datasets per cell, so differences of a point or two are within noise; one catalog, the default world and logging policy; no normalized version of IndependentIPS; the pseudoinverse estimator from #27 isn't implemented. Reproduce with (about 10 minutes on 4 workers):
+
+```bash
+python -m recarena.slate_estimators --slate-sizes 2 3 5 --horizons 1 20 --sizes 1000 5000 --repeats 50 --truth 200000 --workers 4 --output results/independent_ips.md
 ```
 
 ## What if hidden appeal follows what policies favor?

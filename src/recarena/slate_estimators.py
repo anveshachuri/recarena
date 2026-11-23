@@ -1,8 +1,9 @@
-"""Do slate-aware estimators help, and where? (issue #13)
+"""Do slate-aware estimators help, and where? (issues #13 and #27)
 
-Scores the cascade estimators against plain per-decision importance sampling across
-slate sizes, session lengths and the usual five target policies. Only the weighted
-estimators are run, since the comparison is about importance weights.
+Scores the cascade estimators and independent IPS against plain per-decision importance
+sampling across slate sizes, session lengths and the usual five target policies, for
+rewards and for costs. Only the weighted estimators are run, since the comparison is
+about importance weights.
 
 python -m recarena.slate_estimators --slate-sizes 2 3 5 --horizons 1 20 --sizes 1000 5000 --repeats 100 --truth 500000
 """
@@ -18,12 +19,13 @@ from dataclasses import replace
 import numpy as np
 
 from .benchmark import target_policies
-from .data import collect, true_value
+from .data import collect, true_value, with_slot_log_prob
 from .estimators import estimate_all
 from .policies import SoftmaxPolicy
 from .simulator import Catalog, SimConfig
 
-NAMES = ("PDIS", "SNPDIS", "CascadePDIS", "SNCascadePDIS")
+NAMES = ("PDIS", "SNPDIS", "CascadePDIS", "SNCascadePDIS", "IndependentIPS")
+OUTCOMES = ("reward", "cost")
 
 
 def world(slate_size: int, horizon: int) -> SimConfig:
@@ -44,9 +46,16 @@ def estimate_job(job):
     config = world(slate_size, horizon)
     catalog = Catalog.generate(config)
     rng = np.random.default_rng(seed)
-    data = collect(config, catalog, SoftmaxPolicy(catalog, "logging"), n, rng)
+    behavior = SoftmaxPolicy(catalog, "logging")
+    data = collect(config, catalog, behavior, n, rng)
+    # Independent IPS only needs slot probabilities where a slot paid off or added cost.
+    # Computing them draws no random numbers, so the other estimates are unchanged.
+    data = with_slot_log_prob(data, behavior, (data.slot_rewards != 0) | (data.slot_costs != 0))
     out = {
-        p.name: estimate_all(data, data.rewards, p, config.examine_decay, rng, estimators=NAMES)
+        p.name: {
+            "reward": estimate_all(data, data.rewards, p, config.examine_decay, rng, estimators=NAMES),
+            "cost": estimate_all(data, data.costs, p, config.examine_decay, rng, estimators=NAMES),
+        }
         for p in target_policies(catalog)
     }
     return (slate_size, horizon, n), out
@@ -63,25 +72,30 @@ def run(slate_sizes: list[int], horizons: list[int], sizes: list[int], repeats: 
     job_seeds = np.random.SeedSequence([seed, 1]).spawn(len(cells) * repeats)
     jobs = [cell + (job_seeds[i * repeats + r],) for i, cell in enumerate(cells) for r in range(repeats)]
 
-    errors = {cell + (p, e): [] for cell in cells for p in targets for e in names}
+    def true_of(cell, p, outcome) -> float:
+        truth = truths[cell[:2] + (p,)]
+        return truth.reward if outcome == "reward" else truth.cost
+
+    errors = {cell + (p, e, o): [] for cell in cells for p in targets for e in names for o in OUTCOMES}
     with ProcessPoolExecutor(max_workers=workers) as pool:
         truths = dict(pool.map(truth_job, [key + (truth_runs, s) for key, s in zip(truth_keys, truth_seeds)]))
         for cell, out in pool.map(estimate_job, jobs):
             for p in targets:
                 for e in names:
-                    errors[cell + (p, e)].append(out[p][e] - truths[cell[:2] + (p,)].reward)
+                    for o in OUTCOMES:
+                        errors[cell + (p, e, o)].append(out[p][o][e] - true_of(cell, p, o))
 
     def rmse_share(key) -> str:
         """RMSE as a share of the true value, ± its Monte Carlo standard error (delta method)."""
         sq = np.square(errors[key])
         rmse = np.sqrt(sq.mean())
         se = sq.std(ddof=1) / np.sqrt(len(sq)) / (2 * rmse) if rmse > 0 else 0.0
-        truth = truths[key[:2] + (key[3],)].reward
+        truth = true_of(key[:3], key[3], key[5])
         return f"{100 * rmse / truth:.1f}% ± {100 * se / truth:.1f}"
 
     def bias_share(key) -> str:
         err = np.asarray(errors[key])
-        truth = truths[key[:2] + (key[3],)].reward
+        truth = true_of(key[:3], key[3], key[5])
         return f"{100 * err.mean() / truth:+.1f}% ± {100 * err.std(ddof=1) / np.sqrt(len(err)) / truth:.1f}"
 
     base = SimConfig()
@@ -94,18 +108,31 @@ def run(slate_sizes: list[int], horizons: list[int], sizes: list[int], repeats: 
         "of only the first j slots at step t. It is unbiased here because users read top down and stop at their "
         "first click. SNCascadePDIS normalizes the weights for each step and slot.",
         "",
-        "## True values",
+        "IndependentIPS (Li et al. 2018) weights a value in slot j of step t by the full slate ratios of earlier "
+        "steps times the ratio of the chance that the logged item lands in slot j, over everything else in the "
+        "slate. That assumes a slot's value depends only on its own item. Here that holds for costs within a step "
+        "(a slot adds cost only if its own item is sponsored), so costs are the control, and fails for rewards, "
+        "because a slot's reward depends on whether the user clicked above it.",
         "",
-        "| Slate size | Session length | " + " | ".join(targets) + " |",
-        "|---:|---:|" + "---:|" * len(targets),
     ]
-    for k, h in worlds:
-        lines.append(f"| {k} | {h} | " + " | ".join(f"{truths[(k, h, p)].reward:.4f}" for p in targets) + " |")
-    lines.append("")
+    for outcome in OUTCOMES:
+        lines += [
+            f"## True values ({outcome})",
+            "",
+            "| Slate size | Session length | " + " | ".join(targets) + " |",
+            "|---:|---:|" + "---:|" * len(targets),
+        ]
+        for k, h in worlds:
+            lines.append(
+                f"| {k} | {h} | " + " | ".join(f"{true_of((k, h), p, outcome):.4f}" for p in targets) + " |"
+            )
+        lines.append("")
 
-    for title, cell_fn in (
-        ("Reward error (RMSE as a share of the true value, ± Monte Carlo standard error)", rmse_share),
-        ("Reward bias (average signed error as a share of the true value, ± standard error)", bias_share),
+    for title, outcome, cell_fn in (
+        ("Reward error (RMSE as a share of the true value, ± Monte Carlo standard error)", "reward", rmse_share),
+        ("Reward bias (average signed error as a share of the true value, ± standard error)", "reward", bias_share),
+        ("Cost error (RMSE as a share of the true value, ± Monte Carlo standard error)", "cost", rmse_share),
+        ("Cost bias (average signed error as a share of the true value, ± standard error)", "cost", bias_share),
     ):
         lines += [f"## {title}", ""]
         for k, h in worlds:
@@ -114,7 +141,7 @@ def run(slate_sizes: list[int], horizons: list[int], sizes: list[int], repeats: 
                 lines.append("| Target policy | " + " | ".join(names) + " |")
                 lines.append("|---|" + "---:|" * len(names))
                 for p in targets:
-                    lines.append(f"| {p} | " + " | ".join(cell_fn((k, h, n, p, e)) for e in names) + " |")
+                    lines.append(f"| {p} | " + " | ".join(cell_fn((k, h, n, p, e, outcome)) for e in names) + " |")
                 lines.append("")
     return "\n".join(lines)
 

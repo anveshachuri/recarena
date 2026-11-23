@@ -22,6 +22,10 @@ class LoggedData:
     slot_rewards: np.ndarray | None = None  # (n, horizon, slate_size), the reward each slot produced.
     slot_costs: np.ndarray | None = None  # (n, horizon, slate_size), the cost each slot added.
     behavior_prefix_log_prob: np.ndarray | None = None  # (n, horizon, slate_size)
+    # Optional, for independent IPS: log chance that the logged item in slot j lands in slot j,
+    # over everything else in the slate. NaN where it wasn't computed. ``with_slot_log_prob``
+    # fills it in. ``collect`` doesn't, because it is slow to compute.
+    behavior_slot_log_prob: np.ndarray | None = None  # (n, horizon, slate_size)
 
     @property
     def n(self) -> int:
@@ -45,6 +49,7 @@ class LoggedData:
             pick(self.slot_rewards),
             pick(self.slot_costs),
             pick(self.behavior_prefix_log_prob),
+            pick(self.behavior_slot_log_prob),
         )
 
 
@@ -101,11 +106,31 @@ def relog(data: LoggedData, policy) -> LoggedData:
     n, h, k = data.slates.shape
     flat_obs = data.obs.reshape(n * h, -1)
     flat_slates = data.slates.reshape(n * h, k)
-    return replace(
+    data = replace(
         data,
         behavior_log_prob=policy.log_prob(flat_obs, flat_slates).reshape(n, h),
         behavior_prefix_log_prob=policy.prefix_log_prob(flat_obs, flat_slates).reshape(n, h, k),
     )
+    if data.behavior_slot_log_prob is not None:
+        data = with_slot_log_prob(data, policy, np.isfinite(data.behavior_slot_log_prob))
+    return data
+
+
+def with_slot_log_prob(data: LoggedData, policy, where: np.ndarray | None = None) -> LoggedData:
+    """The same logs with ``behavior_slot_log_prob`` filled in from ``policy``.
+
+    ``where`` (n, horizon, slate_size) picks the entries to compute, since each one is slow.
+    By default it is every slot of every step the user was still there for. Independent IPS
+    only needs the slots whose value is not zero, so
+    ``where=(data.slot_rewards != 0) | (data.slot_costs != 0)`` is enough for rewards and costs.
+    Uses no random numbers.
+    """
+    n, h, k = data.slates.shape
+    if where is None:
+        where = np.broadcast_to(data.active[:, :, None], (n, h, k))
+    where = np.asarray(where, dtype=bool) & data.active[:, :, None]
+    flat = policy.slot_log_prob(data.obs.reshape(n * h, -1), data.slates.reshape(n * h, k), where.reshape(n * h, k))
+    return replace(data, behavior_slot_log_prob=flat.reshape(n, h, k))
 
 
 def check_gamma(gamma: float) -> float:
