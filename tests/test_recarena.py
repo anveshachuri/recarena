@@ -1323,3 +1323,74 @@ def test_weight_mass_experiment_runs_and_reports_every_world():
         assert f"| {world_name(w)} | much greedier |" in report
     assert "### SNPDIS, cost" in report
     assert "| mean session weight below 0.5 |" in report
+
+
+def test_benchmark_json_holds_settings_and_every_run(tmp_path):
+    import json
+
+    from recarena.benchmark import run
+
+    names = ["IPS", "SNIPS"]
+    path = tmp_path / "results.json"
+    report = run([40, 80], seeds=2, truth_runs=2000, budget_ratio=1.25, seed=7, workers=1, estimators=names, json_path=str(path))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    assert saved["experiment"] == "benchmark"
+    assert saved["settings"] == {
+        "sizes": [40, 80],
+        "seeds": 2,
+        "truth_runs": 2000,
+        "budget_ratio": 1.25,
+        "seed": 7,
+        "estimators": names,
+    }
+    truths = {t["policy"]: t for t in saved["truths"]}
+    assert len(truths) == 5
+    assert saved["budget"] == pytest.approx(1.25 * truths["same as logging"]["cost"])
+    # One record per target, size, repeat and estimator.
+    keys = {(r["policy"], r["sessions"], r["repeat"], r["estimator"]) for r in saved["runs"]}
+    assert keys == set(itertools.product(truths, [40, 80], [0, 1], names))
+    assert len(saved["runs"]) == len(keys)
+    for r in saved["runs"]:
+        t = truths[r["policy"]]
+        assert r["reward_error"] == pytest.approx(r["reward_estimate"] - t["reward"])
+        assert r["estimated_within_budget"] == (r["cost_estimate"] <= saved["budget"])
+        assert r["decision_correct"] == (r["estimated_within_budget"] == t["within_budget"])
+    # The file is extra: the Markdown report is the same with and without it.
+    assert report == run([40, 80], seeds=2, truth_runs=2000, budget_ratio=1.25, seed=7, workers=1, estimators=names)
+
+
+def test_stress_json_holds_settings_and_every_run(tmp_path):
+    import json
+
+    from recarena.stress import BUDGET_MARGIN, SCENARIOS, budget_decisions_correct, run
+
+    names = ["IPS", "SNIPS"]
+    path = tmp_path / "results.json"
+    report = run([40], catalogs=1, repeats=2, truth_runs=1000, seed=7, workers=1, estimators=names, json_path=str(path))
+    saved = json.loads(path.read_text(encoding="utf-8"))
+
+    assert saved["experiment"] == "stress"
+    assert saved["settings"] == {
+        "sizes": [40],
+        "catalogs": 1,
+        "repeats": 2,
+        "truth_runs": 1000,
+        "seed": 7,
+        "estimators": names,
+        "budget_margin": BUDGET_MARGIN,
+    }
+    worlds = {(s.hidden_appeal, s.sponsored_annoyance) for s in SCENARIOS}
+    truths = {(t["hidden_appeal"], t["sponsored_annoyance"], t["catalog"], t["policy"]): t for t in saved["truths"]}
+    assert len(truths) == len(worlds) * 5
+    policies = {t["policy"] for t in saved["truths"]}
+    keys = {(r["scenario"], r["catalog"], r["sessions"], r["repeat"], r["policy"], r["estimator"]) for r in saved["runs"]}
+    assert keys == set(itertools.product([s.name for s in SCENARIOS], [0], [40], [0, 1], policies, names))
+    assert len(saved["runs"]) == len(keys)
+    by_name = {s.name: s for s in SCENARIOS}
+    for r in saved["runs"]:
+        s = by_name[r["scenario"]]
+        t = truths[(s.hidden_appeal, s.sponsored_annoyance, r["catalog"], r["policy"])]
+        assert r["reward_error_percent"] == pytest.approx(100 * (r["reward_estimate"] - t["reward"]) / t["reward"])
+        assert r["budget_decisions_correct"] == budget_decisions_correct(r["cost_estimate"], t["cost"])
+    assert report == run([40], catalogs=1, repeats=2, truth_runs=1000, seed=7, workers=1, estimators=names)

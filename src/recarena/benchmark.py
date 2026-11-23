@@ -6,6 +6,7 @@ python -m recarena.benchmark --sizes 200 1000 5000 --seeds 30 --truth 1000000
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor
@@ -42,6 +43,13 @@ def score_one_dataset(job):
     }
 
 
+def write_json(path: str, data: dict) -> None:
+    """Save an experiment's settings and per-run results so they can be analyzed or plotted."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+
+
 def run(
     sizes: list[int],
     seeds: int,
@@ -50,8 +58,13 @@ def run(
     seed: int,
     workers: int,
     estimators=None,
+    json_path: str | None = None,
 ) -> str:
-    """``estimators`` is a list of names, a name-to-function mapping, or None for the built-ins."""
+    """``estimators`` is a list of names, a name-to-function mapping, or None for the built-ins.
+
+    ``json_path``, if given, gets the settings, the true values and one record per logged dataset, target and
+    estimator. The returned Markdown report is the same either way.
+    """
     estimators = resolve_estimators(estimators)
     names = list(estimators)
     config = SimConfig()
@@ -89,14 +102,57 @@ def run(
         for i, n in enumerate(sizes)
         for j in range(seeds)
     ]
+    records = []
     with ProcessPoolExecutor(max_workers=workers) as pool:
-        for n, results in pool.map(score_one_dataset, jobs):
+        for i, (n, results) in enumerate(pool.map(score_one_dataset, jobs)):
             for p in targets:
                 t = truths[p.name]
                 rewards, costs = results[p.name]
                 for e in names:
                     errors[(p.name, n, e)].append(rewards[e] - t.reward)
                     correct[(p.name, n, e)] += (costs[e] <= budget) == (t.cost <= budget)
+                    records.append(
+                        {
+                            "policy": p.name,
+                            "sessions": n,
+                            "repeat": i % seeds,
+                            "estimator": e,
+                            "reward_estimate": float(rewards[e]),
+                            "reward_error": float(rewards[e] - t.reward),
+                            "cost_estimate": float(costs[e]),
+                            "estimated_within_budget": bool(costs[e] <= budget),
+                            "decision_correct": bool((costs[e] <= budget) == (t.cost <= budget)),
+                        }
+                    )
+
+    if json_path:
+        write_json(
+            json_path,
+            {
+                "experiment": "benchmark",
+                "settings": {
+                    "sizes": list(sizes),
+                    "seeds": seeds,
+                    "truth_runs": truth_runs,
+                    "budget_ratio": budget_ratio,
+                    "seed": seed,
+                    "estimators": names,
+                },
+                "budget": float(budget),
+                "truths": [
+                    {
+                        "policy": p.name,
+                        "reward": float(truths[p.name].reward),
+                        "reward_stderr": float(truths[p.name].reward_stderr),
+                        "cost": float(truths[p.name].cost),
+                        "cost_stderr": float(truths[p.name].cost_stderr),
+                        "within_budget": bool(truths[p.name].cost <= budget),
+                    }
+                    for p in targets
+                ],
+                "runs": records,
+            },
+        )
 
     def table(title: str, cell) -> list[str]:
         out = [f"## {title}", ""]
@@ -133,10 +189,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=4004)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--output", default=None)
+    parser.add_argument("--json", default=None, metavar="FILE", help="Also save the settings and every per-run result as JSON")
     parser.add_argument("--estimators", nargs="+", default=None, help=f"Default: all built-in. Available: {', '.join(available_estimators())}")
     args = parser.parse_args()
     start = time.time()
-    report = run(args.sizes, args.seeds, args.truth, args.budget_ratio, args.seed, args.workers, args.estimators)
+    report = run(args.sizes, args.seeds, args.truth, args.budget_ratio, args.seed, args.workers, args.estimators, args.json)
     report += f"\nFinished in {time.time() - start:.0f} s with seed {args.seed}.\n"
     print(report)
     if args.output:

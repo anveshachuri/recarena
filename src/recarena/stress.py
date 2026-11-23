@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
-from .benchmark import target_policies
+from .benchmark import target_policies, write_json
 from .data import TrueValue, collect, true_value
 from .estimators import available_estimators, estimate_all, resolve_estimators
 from .policies import SoftmaxPolicy
@@ -87,8 +87,13 @@ def run(
     seed: int,
     workers: int,
     estimators=None,
+    json_path: str | None = None,
 ) -> str:
-    """``estimators`` is a list of names, a name-to-function mapping, or None for the built-ins."""
+    """``estimators`` is a list of names, a name-to-function mapping, or None for the built-ins.
+
+    ``json_path``, if given, gets the settings, the true values and one record per logged dataset, target and
+    estimator. The returned Markdown report is the same either way.
+    """
     estimators = resolve_estimators(estimators)
     names = list(estimators)
     worlds = sorted({(s.hidden_appeal, s.sponsored_annoyance) for s in SCENARIOS})
@@ -106,8 +111,9 @@ def run(
             )
         )
         rows = []
+        records = []
         jobs = [(*key, s, estimators) for key, s in zip(estimate_keys, estimate_seeds.spawn(len(estimate_keys)))]
-        for (name, catalog_seed, n), results in pool.map(estimate_job, jobs):
+        for i, ((name, catalog_seed, n), results) in enumerate(pool.map(estimate_job, jobs)):
             scenario = next(s for s in SCENARIOS if s.name == name)
             world = (scenario.hidden_appeal, scenario.sponsored_annoyance)
             for policy_name, (rewards, costs) in results.items():
@@ -124,6 +130,51 @@ def run(
                             budget_decisions_correct(costs[e], truth.cost),
                         )
                     )
+                    records.append(
+                        {
+                            "scenario": name,
+                            "catalog": catalog_seed,
+                            "sessions": n,
+                            "repeat": i % repeats,
+                            "policy": policy_name,
+                            "estimator": e,
+                            "reward_estimate": float(rewards[e]),
+                            "reward_error_percent": float(rows[-1][5]),
+                            "cost_estimate": float(costs[e]),
+                            "budget_decisions_correct": rows[-1][6],
+                        }
+                    )
+
+    if json_path:
+        write_json(
+            json_path,
+            {
+                "experiment": "stress",
+                "settings": {
+                    "sizes": list(sizes),
+                    "catalogs": catalogs,
+                    "repeats": repeats,
+                    "truth_runs": truth_runs,
+                    "seed": seed,
+                    "estimators": names,
+                    "budget_margin": BUDGET_MARGIN,
+                },
+                "truths": [
+                    {
+                        "hidden_appeal": world[0],
+                        "sponsored_annoyance": world[1],
+                        "catalog": catalog_seed,
+                        "policy": policy_name,
+                        "reward": float(value.reward),
+                        "reward_stderr": float(value.reward_stderr),
+                        "cost": float(value.cost),
+                        "cost_stderr": float(value.cost_stderr),
+                    }
+                    for (world, catalog_seed, policy_name), value in truths.items()
+                ],
+                "runs": records,
+            },
+        )
 
     def select(**where) -> list[tuple]:
         fields = ("scenario", "catalog", "n", "policy", "estimator")
@@ -208,10 +259,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=4004)
     parser.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     parser.add_argument("--output", default=None)
+    parser.add_argument("--json", default=None, metavar="FILE", help="Also save the settings and every per-run result as JSON")
     parser.add_argument("--estimators", nargs="+", default=None, help=f"Default: all built-in. Available: {', '.join(available_estimators())}")
     args = parser.parse_args()
     start = time.time()
-    report = run(args.sizes, args.catalogs, args.repeats, args.truth, args.seed, args.workers, args.estimators)
+    report = run(args.sizes, args.catalogs, args.repeats, args.truth, args.seed, args.workers, args.estimators, args.json)
     report += f"\nFinished in {time.time() - start:.0f} s with seed {args.seed}.\n"
     print(report)
     if args.output:
