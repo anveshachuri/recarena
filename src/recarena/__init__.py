@@ -1,6 +1,6 @@
 """recarena: score off-policy evaluation methods against known true answers."""
 
-from .data import LoggedData, TrueValue, collect, relog, true_value
+from .data import LoggedData, TrueValue, collect, relog, true_value, with_slot_log_prob
 from .env import SlateRecEnv
 from .estimators import (
     ESTIMATOR_NAMES,
@@ -37,4 +37,5 @@ __all__ = [
     "relog",
     "true_value",
     "weight_diagnostics",
+    "with_slot_log_prob",
 ]

@@ -711,6 +711,7 @@ def test_exploration_experiment_runs_and_reports_every_logging_policy():
 # Slate-aware estimators (issue #13)
 # ---------------------------------------------------------------------------
 
+from recarena import with_slot_log_prob  # noqa: E402
 from recarena.estimators import SLATE_AWARE_NAMES, _cascade_pdis, _sn_cascade_pdis, prefix_ratios  # noqa: E402
 
 
@@ -827,7 +828,7 @@ def test_cascade_pdis_is_pdis_when_every_value_sits_in_the_last_slot():
 def test_cascade_estimators_are_on_policy_means_when_target_is_logging():
     catalog = Catalog.generate(SHORT)
     policy = SoftmaxPolicy(catalog)
-    data = collect(SHORT, catalog, policy, 500, np.random.default_rng(42))
+    data = with_slot_log_prob(collect(SHORT, catalog, policy, 500, np.random.default_rng(42)), policy)
     assert np.allclose(prefix_ratios(data, policy), 1.0)
     results = estimate_all(data, data.costs, policy, SHORT.examine_decay, np.random.default_rng(0), estimators=SLATE_AWARE_NAMES)
     for value in results.values():
@@ -893,7 +894,8 @@ def test_slate_estimator_experiment_runs_and_reports_every_world():
     report = run([2, 3], [1, 2], [100], 2, 2000, 1, 1)
     for k, h in [(2, 1), (2, 2), (3, 1), (3, 2)]:
         assert f"### Slates of {k}, sessions up to {h} steps, 100 sessions logged" in report
-    assert "| Target policy | PDIS | SNPDIS | CascadePDIS | SNCascadePDIS |" in report
+    assert "| Target policy | PDIS | SNPDIS | CascadePDIS | SNCascadePDIS | IndependentIPS |" in report
+    assert "## Cost bias" in report and "## True values (cost)" in report
 
 
 def test_sn_cascade_delta_method_standard_error_matches_the_bootstrap():
@@ -1323,3 +1325,182 @@ def test_weight_mass_experiment_runs_and_reports_every_world():
         assert f"| {world_name(w)} | much greedier |" in report
     assert "### SNPDIS, cost" in report
     assert "| mean session weight below 0.5 |" in report
+
+
+# Independent IPS (issue #27)
+
+from recarena.data import relog  # noqa: E402
+from recarena.estimators import slot_ratios  # noqa: E402
+from recarena.policies import plackett_luce_slot_log_prob  # noqa: E402
+
+
+def brute_force_slot_probabilities(policy, obs, n_items, slate_size):
+    """P(item i in slot j) by summing every slate's probability. Shares no code with the quadrature."""
+    slates = np.array(list(itertools.permutations(range(n_items), slate_size)))
+    probs = np.exp(policy.log_prob(np.tile(obs, (len(slates), 1)), slates))
+    table = np.zeros((slate_size, n_items))
+    for j in range(slate_size):
+        np.add.at(table[j], slates[:, j], probs)
+    return slates, table
+
+
+@pytest.mark.parametrize("kind", ["softmax", "greedy softmax", "mixture"])
+def test_slot_probabilities_match_brute_force(kind):
+    config = SimConfig(n_items=10, n_topics=2, slate_size=4, horizon=1, catalog_seed=6)
+    catalog = Catalog.generate(config)
+    policy = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5, sponsored_weight=0.5)
+    if kind == "greedy softmax":
+        policy = SoftmaxPolicy(catalog, quality_weight=1.0, temperature=0.5)
+    if kind == "mixture":
+        policy = UniformMixturePolicy(policy, 0.3)
+    for row in np.random.default_rng(1).random((3, config.n_topics + 2)):
+        slates, table = brute_force_slot_probabilities(policy, row[None, :], config.n_items, config.slate_size)
+        got = np.exp(policy.slot_log_prob(np.tile(row, (len(slates), 1)), slates))
+        expected = table[np.arange(config.slate_size)[None, :], slates]
+        assert got == pytest.approx(expected, rel=1e-9)
+
+
+def test_slot_probabilities_sum_to_one_over_items_for_every_target_policy():
+    from recarena.benchmark import target_policies
+
+    config = SimConfig(slate_size=5)
+    catalog = Catalog.generate(config)
+    rng = np.random.default_rng(2)
+    obs = np.column_stack([rng.dirichlet(np.ones(config.n_topics), 4) * 0.8, rng.random((4, 2))])
+    items = np.arange(config.n_items)
+    for policy in target_policies(catalog):
+        for row in obs:
+            for j in range(config.slate_size):
+                # Item i in slot j. The other slots hold any other items, which don't change the answer.
+                slates = []
+                for i in items:
+                    rest = items[items != i][: config.slate_size - 1]
+                    slates.append(np.insert(rest, j, i))
+                got = np.exp(policy.slot_log_prob(np.tile(row, (config.n_items, 1)), np.array(slates))[:, j])
+                assert got.sum() == pytest.approx(1.0, abs=1e-10)
+
+
+def test_slot_probabilities_refuse_policies_too_peaked_for_the_quadrature():
+    scores = np.array([[8.0, 7.5, 0.0, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="too peaked"):
+        plackett_luce_slot_log_prob(scores, np.array([[2, 3, 4]]))
+    # The first slot needs no quadrature, and where= can skip the rest.
+    first_only = plackett_luce_slot_log_prob(scores, np.array([[2, 3, 4]]), np.array([[True, False, False]]))
+    assert np.isnan(first_only[0, 1:]).all()
+    assert np.exp(first_only[0, 0]) == pytest.approx(1.0 / (np.exp(8.0) + np.exp(7.5) + 3.0))
+
+
+def handmade_independent_logs():
+    """Two sessions of two steps from the 4-item catalog, with slot values set by hand."""
+    catalog = Catalog.generate(SMALL)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, quality_weight=2.0)
+    obs = np.zeros((2, 2, SMALL.n_topics + 2))
+    slates = np.array([[[2, 0], [1, 3]], [[0, 1], [3, 2]]])
+    slot_values = np.zeros((2, 2, 2))
+    slot_values[0, 0, 1] = 0.5  # Session one, step one, slot two.
+    slot_values[0, 1, 0] = 0.25  # Session one, step two, slot one.
+    slot_values[1, 1, 1] = 1.0  # Session two, step two, slot two.
+    active = np.ones((2, 2), dtype=bool)
+    flat_obs, flat_slates = obs.reshape(4, -1), slates.reshape(4, 2)
+    data = LoggedData(
+        obs,
+        slates,
+        slot_values.sum(axis=2),
+        np.zeros((2, 2)),
+        active,
+        behavior.log_prob(flat_obs, flat_slates).reshape(2, 2),
+        slot_rewards=slot_values,
+        slot_costs=np.zeros((2, 2, 2)),
+        behavior_prefix_log_prob=behavior.prefix_log_prob(flat_obs, flat_slates).reshape(2, 2, 2),
+    )
+    return catalog, behavior, target, data
+
+
+def test_independent_ips_matches_hand_calculation():
+    catalog, behavior, target, data = handmade_independent_logs()
+    data = with_slot_log_prob(data, behavior)
+
+    def softmax(policy):
+        w = np.exp(policy.quality_weight * catalog.quality)
+        return w / w.sum()
+
+    def in_slot(p, item, slot):
+        # Slot one: p_i. Slot two: sum over the first item m of p_m * p_i / (1 - p_m).
+        if slot == 0:
+            return p[item]
+        return sum(p[m] * p[item] / (1 - p[m]) for m in range(len(p)) if m != item)
+
+    def slate(p, items):
+        return p[items[0]] * p[items[1]] / (1 - p[items[0]])
+
+    pb, pt = softmax(behavior), softmax(target)
+    # Session one: 0.5 * (slot ratio of item 0 in slot two at step one)
+    #   + 0.25 * (whole slate ratio at step one) * (slot ratio of item 1 in slot one at step two).
+    one = 0.5 * in_slot(pt, 0, 1) / in_slot(pb, 0, 1) + 0.25 * slate(pt, [2, 0]) / slate(pb, [2, 0]) * pt[1] / pb[1]
+    # Session two: 1.0 * (whole slate ratio at step one) * (slot ratio of item 2 in slot two at step two).
+    two = 1.0 * slate(pt, [0, 1]) / slate(pb, [0, 1]) * in_slot(pt, 2, 1) / in_slot(pb, 2, 1)
+    result = estimate_all_detailed(
+        data, data.rewards, target, SMALL.examine_decay, np.random.default_rng(0), estimators=["IndependentIPS"]
+    )["IndependentIPS"]
+    assert result.value == pytest.approx((one + two) / 2)
+    assert result.influence == pytest.approx([(one - two) / 2, (two - one) / 2])
+    assert np.exp(data.behavior_slot_log_prob[0, 0]) == pytest.approx([pb[2], in_slot(pb, 0, 1)])
+
+
+def test_independent_ips_needs_slot_probabilities_where_values_are_not_zero():
+    catalog, behavior, target, bare = handmade_independent_logs()
+    rng = np.random.default_rng(0)
+    with pytest.raises(ValueError, match="with_slot_log_prob"):
+        estimate_all(bare, bare.rewards, target, 1.0, rng, estimators=["IndependentIPS"])
+    only_some = with_slot_log_prob(bare, behavior, bare.slot_rewards == 0)
+    with pytest.raises(ValueError, match="missing for some slots"):
+        estimate_all(only_some, only_some.rewards, target, 1.0, rng, estimators=["IndependentIPS"])
+    enough = with_slot_log_prob(bare, behavior, bare.slot_rewards != 0)
+    full = with_slot_log_prob(bare, behavior)
+    assert estimate_all(enough, enough.rewards, target, 1.0, rng, estimators=["IndependentIPS"]) == pytest.approx(
+        estimate_all(full, full.rewards, target, 1.0, rng, estimators=["IndependentIPS"])
+    )
+    # Slots it skipped have ratio 1.
+    assert np.all(slot_ratios(enough, target, enough.slot_rewards != 0)[enough.slot_rewards == 0] == 1.0)
+
+
+def test_slot_probabilities_follow_subset_and_relog():
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    other = SoftmaxPolicy(catalog, quality_weight=2.0)
+    data = with_slot_log_prob(collect(SHORT, catalog, behavior, 50, np.random.default_rng(47)), behavior)
+    assert np.isnan(data.behavior_slot_log_prob[~data.active]).all()
+    assert np.array_equal(data.subset(np.arange(5)).behavior_slot_log_prob, data.behavior_slot_log_prob[:5], equal_nan=True)
+    first = data.behavior_slot_log_prob[:, :, 0][data.active]
+    assert np.allclose(first, data.behavior_prefix_log_prob[:, :, 0][data.active])
+    relogged = relog(data, other)
+    assert np.allclose(relogged.behavior_slot_log_prob, with_slot_log_prob(data, other).behavior_slot_log_prob, equal_nan=True)
+
+
+def test_independent_ips_recovers_multi_step_cost_truth():
+    """Costs depend only on each slot's own item, so independent IPS is unbiased for them."""
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5, sponsored_weight=1.0)
+    truth = true_value(SHORT, catalog, target, 300_000, np.random.default_rng(48))
+    data = collect(SHORT, catalog, behavior, 300_000, np.random.default_rng(49))
+    data = with_slot_log_prob(data, behavior, data.slot_costs != 0)
+    estimate = estimate_all_detailed(
+        data, data.costs, target, SHORT.examine_decay, np.random.default_rng(0), estimators=["IndependentIPS"]
+    )["IndependentIPS"]
+    assert within(estimate.value, truth.cost, np.hypot(estimate.standard_error(), truth.cost_stderr))
+
+
+def test_independent_ips_is_biased_for_cascade_rewards():
+    """Rewards break its assumption: a slot only pays off if nothing above it was clicked."""
+    catalog = Catalog.generate(SMALL)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, quality_weight=-3.0)
+    data = collect(SMALL, catalog, behavior, 400_000, np.random.default_rng(50))
+    data = with_slot_log_prob(data, behavior, data.slot_rewards != 0)
+    estimate = estimate_all_detailed(
+        data, data.rewards, target, SMALL.examine_decay, np.random.default_rng(0), estimators=["IndependentIPS"]
+    )["IndependentIPS"]
+    truth = exact_one_step_value(SMALL, catalog, target)
+    assert not within(estimate.value, truth, estimate.standard_error(), sigmas=6.0)

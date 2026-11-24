@@ -23,7 +23,7 @@ The full stress test takes a long time. Don't run it unless the task needs it.
 | `src/recarena/estimators.py` | Off-policy estimators and fitted Q evaluation |
 | `src/recarena/benchmark.py`, `stress.py` | Scoring estimators against true values |
 | `src/recarena/exploration.py` | How the logging policy's exploration level changes estimator error (#17) |
-| `src/recarena/slate_estimators.py` | Slate-aware (cascade) estimators against plain per-decision IS (#13) |
+| `src/recarena/slate_estimators.py` | Slate-aware estimators (cascade, independent IPS) against plain per-decision IS, for rewards and costs (#13, #27) |
 | `src/recarena/linked_appeal.py` | Hidden appeal linked to quality or sponsorship (#9) |
 | `src/recarena/propensity_error.py` | Estimators when the logged probabilities are slightly wrong or fitted from the logs (#20) |
 | `src/recarena/budget.py` | False approvals and false rejections of budgets, and deciding with an upper bound on cost (#16) |
