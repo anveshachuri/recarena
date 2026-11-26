@@ -26,6 +26,7 @@ The full stress test takes a long time. Don't run it unless the task needs it.
 | `src/recarena/slate_estimators.py` | Slate-aware estimators (cascade, independent IPS) against plain per-decision IS, for rewards and costs (#13, #27) |
 | `src/recarena/linked_appeal.py` | Hidden appeal linked to quality or sponsorship (#9) |
 | `src/recarena/propensity_error.py` | Estimators when the logged probabilities are slightly wrong or fitted from the logs (#20) |
+| `src/recarena/propensity_check.py` | Which probe policies make the wrong-probability check reliable, including a score test (#29) |
 | `src/recarena/budget.py` | False approvals and false rejections of budgets, and deciding with an upper bound on cost (#16) |
 | `src/recarena/weight_mass.py` | The mean session weight as a warning sign for far targets (#24) |
 | `tests/test_recarena.py` | Hand calculations and statistical checks |

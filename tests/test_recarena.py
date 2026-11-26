@@ -1050,6 +1050,74 @@ def test_propensity_error_experiment_runs_and_reports_every_kind_of_error():
     assert "## Warning sign: share of datasets flagged (100 sessions)" in report
 
 
+# Probes for the wrong-probability check (issue #29).
+
+
+def test_score_probes_raise_one_weight_of_softmax_and_mixture_policies():
+    from recarena.propensity_check import SCORE_STEP, score_probes
+
+    catalog = Catalog.generate(SHORT)
+    softmax = SoftmaxPolicy(catalog, history_weight=2.0, quality_weight=1.5, sponsored_weight=-0.5, temperature=0.8)
+    probes = score_probes(softmax)
+    assert [(p.history_weight, p.quality_weight, p.sponsored_weight) for p in probes] == [
+        (2.0 + SCORE_STEP, 1.5, -0.5),
+        (2.0, 1.5 + SCORE_STEP, -0.5),
+        (2.0, 1.5, -0.5 + SCORE_STEP),
+    ]
+    assert all(p.temperature == 0.8 for p in probes)
+    mixture = UniformMixturePolicy(softmax, 0.1)
+    probes = score_probes(mixture)
+    assert all(isinstance(p, UniformMixturePolicy) and p.epsilon == 0.1 for p in probes)
+    assert [p.base.quality_weight for p in probes] == [1.5, 1.5 + SCORE_STEP, 1.5]
+
+
+def test_chi_square_statistic_matches_hand_calculation():
+    from recarena.propensity_check import chi_square_statistic
+
+    sums = np.array([[1.0, 0.0], [2.0, 1.0], [0.0, -1.0], [3.0, 2.0], [-1.0, 1.0]])
+    mean = sums.mean(axis=0)
+    cov = np.cov(sums, rowvar=False)
+    stat, df = chi_square_statistic(sums)
+    assert df == 2
+    assert stat == pytest.approx(5 * mean @ np.linalg.solve(cov, mean))
+    # A repeated column adds no information: same statistic as the first column alone, 1 degree of freedom.
+    stat, df = chi_square_statistic(np.column_stack([sums[:, 0], sums[:, 0]]))
+    assert df == 1
+    assert stat == pytest.approx(5 * mean[0] ** 2 / sums[:, 0].var(ddof=1))
+    assert chi_square_statistic(np.zeros((5, 3))) == (0.0, 0)
+
+
+def test_check_is_quiet_with_exact_or_fitted_probabilities_and_flags_a_wrong_temperature():
+    from recarena import relog
+    from recarena.benchmark import target_policies
+    from recarena.propensity_check import SCORE_STEP, SCORE_WEIGHTS, check
+    from recarena.propensity_error import fit_softmax_policy
+
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog, "logging")
+    targets = target_policies(catalog)
+    data = collect(SHORT, catalog, behavior, 3000, np.random.default_rng(29))
+    exact = check(data, behavior, targets)
+    assert all(abs(v) < 3 for v in exact.values() if not isinstance(v, bool))
+    wrong = SoftmaxPolicy(catalog, temperature=1.5)
+    flags = check(relog(data, wrong), wrong, targets)
+    assert flags["score test"] and flags["all probes, Bonferroni"]
+    # At the maximum likelihood fit the score is 0, so the score probes can't see a fitted policy.
+    fitted = fit_softmax_policy(catalog, data)
+    flags = check(relog(data, fitted), fitted, targets)
+    assert all(abs(flags[f"{w} +{SCORE_STEP:g}"]) < 0.1 for w in SCORE_WEIGHTS)
+    assert not flags["score test"]
+
+
+def test_propensity_check_experiment_runs_for_both_logging_policies():
+    from recarena.propensity_check import LOGGING, run
+
+    report = run(sizes=[100], repeats=2, truth_runs=500, seed=0, workers=1)
+    for kind in LOGGING:
+        assert f"## Logging: {kind}, 100 sessions" in report
+    assert "| fitted, quality only |" in report and "score test" in report
+
+
 # Discount factor (issue #5).
 
 
