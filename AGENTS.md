@@ -29,6 +29,7 @@ The full stress test takes a long time. Don't run it unless the task needs it.
 | `src/recarena/propensity_check.py` | Which probe policies make the wrong-probability check reliable, including a score test (#29) |
 | `src/recarena/budget.py` | False approvals and false rejections of budgets, and deciding with an upper bound on cost (#16) |
 | `src/recarena/weight_mass.py` | The mean session weight as a warning sign for far targets (#24) |
+| `src/recarena/late_steps.py` | Per-decision error split by step, and discounting against truncating the session (#31) |
 | `tests/test_recarena.py` | Hand calculations and statistical checks |
 
 ## Rules that are easy to break

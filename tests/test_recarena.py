@@ -1572,3 +1572,74 @@ def test_independent_ips_is_biased_for_cascade_rewards():
     )["IndependentIPS"]
     truth = exact_one_step_value(SMALL, catalog, target)
     assert not within(estimate.value, truth, estimate.standard_error(), sigmas=6.0)
+
+
+# Per-step error and truncation (issue #31)
+
+from recarena.late_steps import step_terms, step_weights, true_step_values, variant_estimates  # noqa: E402
+
+
+def test_step_terms_match_hand_calculation():
+    values = np.array([[1.0, 2.0], [3.0, 0.0]])
+    ratios = np.array([[2.0, 0.5], [1.0, 1.0]])
+    # Cumulative weights [[2, 1], [1, 1]].
+    assert np.allclose(step_terms(values, ratios), [(2 * 1 + 1 * 3) / 2, (1 * 2 + 1 * 0) / 2])
+    assert np.allclose(step_terms(values, ratios, normalized=True), [(2 + 3) / 3, (2 + 0) / 2])
+
+
+def test_step_terms_add_up_to_pdis_and_snpdis():
+    rng = np.random.default_rng(31)
+    values = rng.random((50, 6))
+    ratios = rng.lognormal(0.0, 0.5, (50, 6))
+    assert np.isclose(step_terms(values, ratios).sum(), pdis(None, values, ratios))
+    assert np.isclose(step_terms(values, ratios, normalized=True).sum(), snpdis(None, values, ratios))
+
+
+def test_true_step_values_add_up_to_true_value_with_the_same_seed():
+    catalog = Catalog.generate(SHORT)
+    policy = SoftmaxPolicy(catalog, temperature=0.5)
+    steps = true_step_values(SHORT, catalog, policy, 3_000, np.random.default_rng(7), chunk=1_000)
+    total = true_value(SHORT, catalog, policy, 3_000, np.random.default_rng(7), chunk=1_000)
+    assert steps.reward.shape == (SHORT.horizon,)
+    assert np.isclose(steps.reward.sum(), total.reward)
+    assert np.isclose(steps.cost.sum(), total.cost)
+    discounted = true_value(SHORT, catalog, policy, 3_000, np.random.default_rng(7), chunk=1_000, gamma=0.5)
+    assert np.isclose(steps.weighted(step_weights(SHORT.horizon, 0.5, SHORT.horizon))[0], discounted.reward)
+    # The added per-step standard errors bound the full one.
+    assert steps.weighted(np.ones(SHORT.horizon))[1] >= total.reward_stderr
+
+
+def test_variant_estimates_truncate_ips_to_the_kept_steps():
+    values = np.array([[1.0, 2.0, 4.0], [3.0, 0.0, 1.0]])
+    ratios = np.array([[2.0, 0.5, 3.0], [1.0, 1.0, 0.5]])
+    first_two = variant_estimates(values, ratios, 1.0, 2)
+    # IPS on two steps: weights 1 and 1, returns 3 and 3.
+    assert np.isclose(first_two["IPS"], (1 * 3 + 1 * 3) / 2)
+    assert np.isclose(first_two["PDIS"], step_terms(values, ratios)[:2].sum())
+    discounted = variant_estimates(values, ratios, 0.5, 3)
+    assert np.isclose(discounted["PDIS"], step_terms(values, ratios) @ (0.5 ** np.arange(3)))
+    assert np.isclose(discounted["IPS"], ips(None, values, ratios, 0.5))
+
+
+def test_pdis_step_terms_recover_each_step_truth():
+    catalog = Catalog.generate(SHORT)
+    behavior = SoftmaxPolicy(catalog)
+    target = SoftmaxPolicy(catalog, history_weight=1.5, quality_weight=1.2)
+    truth = true_step_values(SHORT, catalog, target, 200_000, np.random.default_rng(60))
+    data = collect(SHORT, catalog, behavior, 200_000, np.random.default_rng(61))
+    weighted = np.cumprod(importance_ratios(data, target), axis=1) * data.rewards
+    terms = weighted.mean(axis=0)
+    stderr = weighted.std(axis=0, ddof=1) / np.sqrt(data.n)
+    assert np.allclose(step_terms(data.rewards, importance_ratios(data, target)), terms)
+    for t in range(SHORT.horizon):
+        assert within(terms[t], truth.reward[t], np.hypot(stderr[t], truth.reward_stderr[t]))
+
+
+def test_late_steps_experiment_runs_and_reports_far_targets():
+    from recarena.late_steps import run
+
+    report = run(catalogs=1, sizes=[100], repeats=3, truth_runs=500, seed=0, workers=1)
+    assert "## PDIS, reward: signed error of each block of steps" in report
+    assert "## SNPDIS, cost: signed error of each block of steps" in report
+    assert "| default + 10% uniform | 100 | much greedier | first 5 steps |" in report
+    assert "## Step by step reward error for pushes sponsored" in report
