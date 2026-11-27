@@ -246,6 +246,23 @@ The session weight, the product of the slate probability ratios over a session, 
 python -m recarena.weight_mass --catalogs 5 --size 5000 --repeats 40 --truth 200000
 ```
 
+## Which probe should check the logged probabilities? (#29)
+
+The check above tests whether the per-session sum of (ratio - 1) has mean 0, and its power depends on which policy supplies the ratios. `python -m recarena.propensity_check` compares eight probes: the five targets, and three score probes, the claimed logged policy with one weight (history, quality or sponsored) raised by 0.05. As the step shrinks, the score probes measure the score of the logged policy's own weights. It also runs two combined tests: a chi-square **score test** on the three score probes together, and a Bonferroni test over all eight probes. Full tables are in [`results/propensity_check.md`](results/propensity_check.md). What it found in the default world, with 50 datasets per cell (small: a 5% rate has a Monte Carlo standard error of about 3 points), for the default logging policy and a 10% uniform mixture of it, at 1,000 and 5,000 sessions:
+
+- **We recommend the score test.** With exact probabilities it flagged 11 of 200 datasets over the four cells (5.5% ± 1.6, from 2% to 8% per cell), against 4.0% ± 1.4 for Bonferroni. It needs no choice of target, and its power was close to Bonferroni's in every row.
+- **It caught every temperature error at 5,000 sessions** with both logging policies. At 1,000 sessions it caught 90% to 100% with default logging and 60% (temperature 1.1) to 100% with mixture logging.
+- **Single probes have blind spots.** "Pushes sponsored" flagged temperature errors in 0% to 72% of datasets. The quality probe caught temperature errors (84% to 100%) but never the quality only fit, whose quality weight is fitted, so its score is 0. The history probe caught that fit instead (64% to 100%). The score test covers both.
+- **A wrong history weight is hard to see and hardly matters.** The score test flagged it in 6% to 18% of datasets, and it moved SNPDIS by at most 0.2% of the true value.
+- **A flag lines up with a large shift.** Over all datasets with wrong probabilities, the score test flagged 84% to 99% of those where SNPDIS moved by more than 2% of the true value on some near target, and 24% to 45% of the rest.
+- **It can't see a fitted policy of the wrong form.** At the maximum likelihood fit the score is 0, so with mixture logging a plain softmax fitted with all three features was never flagged by the score test (Bonferroni: 2% at 5,000 sessions). That fit moved SNPDIS by at most 1.1% of the true value here.
+
+**Limits:** 50 datasets per cell, one catalog, the default world, rewards only, SNPDIS only for the shifts, and a 10% uniform mixture as the only logging policy of a different form. Reproduce with:
+
+```bash
+python -m recarena.propensity_check --sizes 1000 5000 --repeats 50 --truth 100000 --workers 4 --output results/propensity_check.md
+```
+
 ## How it's tested
 
 The tests compare the simulator with values worked out by hand from every possible slate, check the estimators against hand-calculated answers, and confirm that doubly robust stays unbiased even with a deliberately wrong model.
