@@ -246,6 +246,23 @@ The session weight, the product of the slate probability ratios over a session, 
 python -m recarena.weight_mass --catalogs 5 --size 5000 --repeats 40 --truth 200000
 ```
 
+## Is far target error a late step effect? (#31)
+
+PDIS and SNPDIS are sums over steps, and so is the true value, so each estimate splits into one term per step, scored against that step's own true value. `python -m recarena.late_steps` does that in the default world, and also scores discounting (gamma 0.9 and 0.7) against truncating the session after 5 or 10 steps, each against its own true value. Full tables are in [`results/late_steps.md`](results/late_steps.md). What it found with 3 catalogs and 120 logged datasets per row, for the default logging policy and a 10% uniform mixture of it, at 1,000, 5,000 and 20,000 sessions:
+
+- **Mostly yes, for SNPDIS.** On far targets steps 1 to 5 added at most 1.4% of the true value to SNPDIS's reward error in every row. Steps 11 to 20 hold only 9% of the true reward, but added about half or more of SNPDIS's error: with default logging at 5,000 sessions, -3.9% of the full -6.9% for "much greedier" and -3.2% of -5.6% for "pushes sponsored". For costs the late half holds 17% of the value and added -9.7% of SNPDIS's -15.2% for "pushes sponsored".
+- **PDIS is noisier than it is biased.** Its block errors carry rare huge datasets (+33% ± 37 in one block with mixture logging at 5,000 sessions), so its averages move around more than SNPDIS's.
+- **The weight mass drops after the error takes off.** On far targets, each step's own term passed a 20% relative RMSE by step 2 to 5, while the median step mean weight from #24 first fell below 0.9 at step 4 to 9. So a low step mean weight comes too late to say where an estimate stops being trustworthy. On near targets the same threshold was only passed at step 10 or later, where the step's true value is tiny, or never.
+- **Truncating saves IPS and SNIPS, discounting is slightly better for the per-decision estimators.** At 5,000 and 20,000 sessions, SNPDIS's relative RMSE on far targets was 3.3% to 7.5% at gamma 0.7 and 4.7% to 11.7% for the first 5 steps, against 14% to 25% for the full value. IPS keeps the whole session weight under discounting, so it stayed at 56% to 631% there, but fell to 14% to 82% for the first 5 steps. The two values ask different questions, so this compares how well each is estimated, not which one to report.
+
+For interval coverage (#14) this means the undiscounted value carries a late step bias that a discounted or truncated value mostly avoids, so a coverage result should say which value it covers.
+
+**Limits:** one world, 3 catalogs, 120 datasets per row (datasets from the same catalog share a true value), a 20% threshold chosen by hand, and costs only at 5,000 sessions. Reproduce with:
+
+```bash
+python -m recarena.late_steps --catalogs 3 --sizes 1000 5000 20000 --repeats 40 --truth 300000 --workers 4 --output results/late_steps.md
+```
+
 ## Which probe should check the logged probabilities? (#29)
 
 The check above tests whether the per-session sum of (ratio - 1) has mean 0, and its power depends on which policy supplies the ratios. `python -m recarena.propensity_check` compares eight probes: the five targets, and three score probes, the claimed logged policy with one weight (history, quality or sponsored) raised by 0.05. As the step shrinks, the score probes measure the score of the logged policy's own weights. It also runs two combined tests: a chi-square **score test** on the three score probes together, and a Bonferroni test over all eight probes. Full tables are in [`results/propensity_check.md`](results/propensity_check.md). What it found in the default world, with 50 datasets per cell (small: a 5% rate has a Monte Carlo standard error of about 3 points), for the default logging policy and a 10% uniform mixture of it, at 1,000 and 5,000 sessions:
